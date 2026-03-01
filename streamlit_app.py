@@ -1,7 +1,11 @@
 import streamlit as st
 import pandas as pd
-from snowflake.snowpark.context import get_active_session
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import snowflake.connector
 from datetime import date, timedelta
+import os
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -34,6 +38,10 @@ def get_theme():
             "accent_blue": "#1A6EBD",
             "green": "#2ECC71",
             "red": "#E74C3C",
+            "plotly_paper": "#060B18",
+            "plotly_plot": "#0D1526",
+            "plotly_grid": "#1E3A5F",
+            "plotly_text": "#8A9BBE",
         }
     else:
         return {
@@ -52,6 +60,10 @@ def get_theme():
             "accent_blue": "#1A6EBD",
             "green": "#27AE60",
             "red": "#C0392B",
+            "plotly_paper": "#EAECF0",
+            "plotly_plot": "#F0F2F5",
+            "plotly_grid": "#C8CDD8",
+            "plotly_text": "#3A4A63",
         }
 
 T = get_theme()
@@ -405,36 +417,51 @@ button[data-baseweb="tab"][aria-selected="true"] {{
 """, unsafe_allow_html=True)
 
 # ─── SNOWFLAKE CONNECTION ─────────────────────────────────────────────────────
-session = get_active_session()
+def get_credentials():
+    """Try Streamlit Cloud secrets first, then fall back to local .env file"""
+    try:
+        return {
+            "user": st.secrets["SNOWFLAKE_USER"],
+            "password": st.secrets["SNOWFLAKE_PASSWORD"],
+            "account": st.secrets["SNOWFLAKE_ACCOUNT"],
+            "warehouse": st.secrets["SNOWFLAKE_WAREHOUSE"],
+        }
+    except Exception:
+        from dotenv import load_dotenv
+        load_dotenv("dot.env")
+        return {
+            "user": os.getenv("SNOWFLAKE_USER"),
+            "password": os.getenv("SNOWFLAKE_PASSWORD"),
+            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+        }
+
+@st.cache_resource
+def get_connection():
+    creds = get_credentials()
+    return snowflake.connector.connect(
+        user=creds["user"],
+        password=creds["password"],
+        account=creds["account"],
+        warehouse=creds["warehouse"],
+        database="FINANCE_AI_DB",
+        schema="STOCK_DATA"
+    )
 
 def run_query(query):
-    df = session.sql(query).to_pandas()
-    # Snowflake returns Decimal types — convert to float for Streamlit charts
-    for col in df.columns:
-        if df[col].dtype == object:
-            try:
-                df[col] = pd.to_numeric(df[col], errors='ignore')
-            except:
-                pass
-        if hasattr(df[col].dtype, 'name') and 'decimal' in str(df[col].dtype).lower():
-            df[col] = df[col].astype(float)
-    # Convert any remaining numeric-like columns
-    for col in df.select_dtypes(include=['object']).columns:
-        try:
-            df[col] = df[col].astype(float)
-        except (ValueError, TypeError):
-            pass
-    return df
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(query)
+    cols = [desc[0] for desc in cur.description]
+    rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
 
 def cortex_complete(prompt):
-    safe = prompt.replace("$$", "")
-    result = session.sql(f"""
-        SELECT SNOWFLAKE.CORTEX.COMPLETE(
-            'mistral-large',
-            $${safe}$$
-        ) as response
-    """).collect()[0]['RESPONSE']
-    return result
+    safe = prompt.replace("'", "\\'").replace("$$", "")
+    result = run_query(f"""
+        SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large', '{safe}') as response
+    """)
+    return result.iloc[0]['RESPONSE']
 
 # ─── TOP NAV ─────────────────────────────────────────────────────────────────
 nav_col1, nav_col2, nav_col3 = st.columns([2, 4, 2])
@@ -450,7 +477,7 @@ with nav_col1:
     """, unsafe_allow_html=True)
 
 with nav_col2:
-    nav_options = ["📊 Analysis", "🔬 Research"]
+    nav_options = ["📊 Analysis", " Research"]
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "📊 Analysis"
     
@@ -583,16 +610,27 @@ with ctrl_col1:
     selected_tickers = st.multiselect(
         "Compare Stocks",
         options=[
+            # Big Tech
             "AAPL","MSFT","GOOGL","GOOG","AMZN","META","NVDA","TSLA","NFLX","AMD",
+            # Finance
             "JPM","BAC","GS","MS","WFC","C","BLK","AXP","V","MA","PYPL","SQ",
+            # Healthcare
             "JNJ","PFE","UNH","ABBV","MRK","LLY","BMY","AMGN","GILD","CVS",
+            # Energy
             "XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
+            # Consumer
             "WMT","TGT","COST","HD","LOW","NKE","SBUX","MCD","YUM",
+            # Industrial
             "BA","CAT","GE","HON","MMM","LMT","RTX","NOC","DE","EMR",
+            # Telecom & Media
             "T","VZ","CMCSA","DIS","PARA","WBD","SPOT","SNAP","TWTR",
+            # Semiconductors
             "INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC","MRVL","AVGO","ARM",
+            # Cloud & Software
             "CRM","ORCL","SAP","ADBE","NOW","SNOW","PLTR","DDOG","ZS","CRWD",
+            # ETFs & Indices
             "SPY","QQQ","DIA","IWM","VTI","GLD","SLV","USO","TLT","HYG",
+            # Other Notable
             "BRK.B","IBM","UBER","LYFT","ABNB","DASH","RBLX","U","RIVN","LCID"
         ],
         default=["AAPL", "MSFT"],
@@ -618,94 +656,136 @@ if selected_tickers:
     """, unsafe_allow_html=True)
 
     tickers_str = ", ".join([f"'{t}'" for t in selected_tickers])
-    chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 Price Trend", "🕯️ OHLC Data", "📊 Volume"])
+    chart_tab1, chart_tab2, chart_tab3 = st.tabs(["📈 Price Trend", "🕯️ Candlestick", "📊 Volume"])
 
     # ── Price Trend Tab ──
     with chart_tab1:
         try:
-            # Aggregate to weekly to reduce data volume for chart rendering
             price_data = run_query(f"""
-                SELECT DATE_TRUNC('week', date) as week_date, ticker, 
-                       AVG(close) as avg_close
+                SELECT date, ticker, close
                 FROM FINANCE_AI_DB.STOCK_DATA.PRICES
                 WHERE ticker IN ({tickers_str})
                   AND date BETWEEN '{date_from}' AND '{date_to}'
-                GROUP BY 1, 2
-                ORDER BY 1
+                ORDER BY date
             """)
+            price_data['DATE'] = pd.to_datetime(price_data['DATE'])
 
-            if len(price_data) > 0:
-                # Build a clean DataFrame for charting
-                chart_data = pd.DataFrame()
-                for ticker in selected_tickers:
-                    ticker_df = price_data[price_data['TICKER'] == ticker].copy()
-                    if len(ticker_df) > 0:
-                        ticker_df = ticker_df.set_index('WEEK_DATE')
-                        chart_data[ticker] = ticker_df['AVG_CLOSE'].astype(float)
-                
-                if not chart_data.empty:
-                    st.line_chart(chart_data)
-                else:
-                    st.warning("No chart data available for selected tickers.")
-            else:
-                st.warning("No data returned for the selected filters.")
+            fig = go.Figure()
+            colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6',
+                      '#F39C12', '#1ABC9C', '#E67E22']
 
+            for i, ticker in enumerate(selected_tickers):
+                df_t = price_data[price_data['TICKER'] == ticker]
+                if len(df_t) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=df_t['DATE'], y=df_t['CLOSE'],
+                        name=ticker, mode='lines',
+                        line=dict(color=colors[i % len(colors)], width=1.8),
+                        hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %d, %Y}}<br>$%{{y:.2f}}<extra></extra>"
+                    ))
+
+            fig.update_layout(
+                paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                font=dict(family='DM Sans', color=T['plotly_text'], size=11),
+                legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'],
+                           borderwidth=1, font=dict(size=11)),
+                xaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                           tickfont=dict(family='JetBrains Mono', size=10),
+                           zeroline=False, showspikes=True, spikecolor=T['gold'],
+                           spikethickness=1, spikedash='dot'),
+                yaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                           tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10),
+                           zeroline=False, showspikes=True, spikecolor=T['gold'],
+                           spikethickness=1, spikedash='dot'),
+                hovermode='x unified',
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=420,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Export button
             csv_data = price_data.to_csv(index=False)
             st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
 
         except Exception as e:
             st.error(f"Error loading price data: {e}")
 
-    # ── OHLC Data Tab ──
+    # ── Candlestick Tab ──
     with chart_tab2:
         if len(selected_tickers) > 1:
-            candle_ticker = st.selectbox("Select ticker for OHLC view", selected_tickers)
+            candle_ticker = st.selectbox("Select ticker for candlestick", selected_tickers)
         else:
             candle_ticker = selected_tickers[0]
 
         try:
-            # Aggregate to weekly for smoother chart
             candle_data = run_query(f"""
-                SELECT DATE_TRUNC('week', date) as week_date,
-                       MAX(high) as high, MIN(low) as low, 
-                       AVG(close) as close, SUM(volume) as volume
+                SELECT date, open, high, low, close, volume
                 FROM FINANCE_AI_DB.STOCK_DATA.PRICES
                 WHERE ticker = '{candle_ticker}'
                   AND date BETWEEN '{date_from}' AND '{date_to}'
-                GROUP BY 1
-                ORDER BY 1
+                ORDER BY date
             """)
+            candle_data['DATE'] = pd.to_datetime(candle_data['DATE'])
 
-            if len(candle_data) > 0:
-                # High/Low/Close chart
-                ohlc_chart = pd.DataFrame()
-                ohlc_chart['High'] = candle_data.set_index('WEEK_DATE')['HIGH'].astype(float)
-                ohlc_chart['Low'] = candle_data.set_index('WEEK_DATE')['LOW'].astype(float)
-                ohlc_chart['Close'] = candle_data.set_index('WEEK_DATE')['CLOSE'].astype(float)
-                st.line_chart(ohlc_chart)
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                               vertical_spacing=0.04, row_heights=[0.75, 0.25])
 
-                # Moving averages
-                if len(candle_data) > 10:
-                    ma_data = pd.DataFrame(index=candle_data['WEEK_DATE'])
-                    ma_data['Close'] = candle_data['CLOSE'].astype(float).values
-                    if len(candle_data) > 10:
-                        ma_data['MA10'] = candle_data['CLOSE'].rolling(10).mean().values
-                    if len(candle_data) > 20:
-                        ma_data['MA20'] = candle_data['CLOSE'].rolling(20).mean().values
-                    ma_data = ma_data.dropna()
-                    if not ma_data.empty:
-                        st.markdown(f"**{candle_ticker} — Moving Averages**")
-                        st.line_chart(ma_data)
+            fig.add_trace(go.Candlestick(
+                x=candle_data['DATE'],
+                open=candle_data['OPEN'], high=candle_data['HIGH'],
+                low=candle_data['LOW'], close=candle_data['CLOSE'],
+                name=candle_ticker,
+                increasing=dict(line=dict(color=T['green'], width=1), fillcolor=T['green']),
+                decreasing=dict(line=dict(color=T['red'], width=1), fillcolor=T['red']),
+                hovertext=candle_ticker
+            ), row=1, col=1)
 
-                st.dataframe(candle_data, use_container_width=True)
-            else:
-                st.warning("No data returned for the selected ticker.")
+            # Moving averages
+            if len(candle_data) > 20:
+                candle_data['MA20'] = candle_data['CLOSE'].rolling(20).mean()
+                fig.add_trace(go.Scatter(
+                    x=candle_data['DATE'], y=candle_data['MA20'],
+                    name='MA 20', line=dict(color=T['gold'], width=1.2, dash='dot'),
+                    hovertemplate="MA20: $%{y:.2f}<extra></extra>"
+                ), row=1, col=1)
+
+            if len(candle_data) > 50:
+                candle_data['MA50'] = candle_data['CLOSE'].rolling(50).mean()
+                fig.add_trace(go.Scatter(
+                    x=candle_data['DATE'], y=candle_data['MA50'],
+                    name='MA 50', line=dict(color='#4A90D9', width=1.2, dash='dot'),
+                    hovertemplate="MA50: $%{y:.2f}<extra></extra>"
+                ), row=1, col=1)
+
+            # Volume bars
+            colors_vol = [T['green'] if c >= o else T['red']
+                         for c, o in zip(candle_data['CLOSE'], candle_data['OPEN'])]
+            fig.add_trace(go.Bar(
+                x=candle_data['DATE'], y=candle_data['VOLUME'],
+                name='Volume', marker_color=colors_vol, opacity=0.7,
+                hovertemplate="Vol: %{y:,.0f}<extra></extra>"
+            ), row=2, col=1)
+
+            fig.update_layout(
+                paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                font=dict(family='DM Sans', color=T['plotly_text'], size=11),
+                legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'], borderwidth=1),
+                xaxis=dict(gridcolor=T['plotly_grid'], rangeslider_visible=False,
+                           tickfont=dict(family='JetBrains Mono', size=10)),
+                yaxis=dict(gridcolor=T['plotly_grid'], tickprefix='$',
+                           tickfont=dict(family='JetBrains Mono', size=10)),
+                xaxis2=dict(gridcolor=T['plotly_grid'], tickfont=dict(family='JetBrains Mono', size=10)),
+                yaxis2=dict(gridcolor=T['plotly_grid'], tickfont=dict(family='JetBrains Mono', size=9)),
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=500,
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
             csv_candle = candle_data.to_csv(index=False)
             st.download_button("📥 Download OHLCV Data", csv_candle, f"{candle_ticker}_ohlcv.csv", "text/csv")
 
         except Exception as e:
-            st.error(f"Error loading OHLC data: {e}")
+            st.error(f"Error loading candlestick data: {e}")
 
     # ── Volume Tab ──
     with chart_tab3:
@@ -720,21 +800,31 @@ if selected_tickers:
             """)
             vol_data['MONTH'] = pd.to_datetime(vol_data['MONTH'])
 
-            if len(vol_data) > 0:
-                # Build clean DataFrame for charting
-                vol_chart = pd.DataFrame()
-                for ticker in selected_tickers:
-                    ticker_df = vol_data[vol_data['TICKER'] == ticker].copy()
-                    if len(ticker_df) > 0:
-                        ticker_df = ticker_df.set_index('MONTH')
-                        vol_chart[ticker] = ticker_df['AVG_VOLUME'].astype(float)
-                
-                if not vol_chart.empty:
-                    st.bar_chart(vol_chart)
-                else:
-                    st.warning("No volume data available.")
-            else:
-                st.warning("No volume data returned.")
+            fig = go.Figure()
+            colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6']
+
+            for i, ticker in enumerate(selected_tickers):
+                df_t = vol_data[vol_data['TICKER'] == ticker]
+                if len(df_t) > 0:
+                    fig.add_trace(go.Bar(
+                        x=df_t['MONTH'], y=df_t['AVG_VOLUME'],
+                        name=ticker, marker_color=colors[i % len(colors)],
+                        opacity=0.85,
+                        hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %Y}}<br>Avg Vol: %{{y:,.0f}}<extra></extra>"
+                    ))
+
+            fig.update_layout(
+                barmode='group',
+                paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                font=dict(family='DM Sans', color=T['plotly_text'], size=11),
+                legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'], borderwidth=1),
+                xaxis=dict(gridcolor=T['plotly_grid'], tickfont=dict(family='JetBrains Mono', size=10)),
+                yaxis=dict(gridcolor=T['plotly_grid'], tickfont=dict(family='JetBrains Mono', size=10),
+                           title='Avg Monthly Volume'),
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=420,
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
             csv_vol = vol_data.to_csv(index=False)
             st.download_button("📥 Download Volume Data", csv_vol, "volume_data.csv", "text/csv")
@@ -830,13 +920,31 @@ Limit results to 20 rows. Use proper aggregations and ORDER BY."""
                     if len(result_df) > 0:
                         st.dataframe(result_df, use_container_width=True)
 
-                        # Auto chart using native Streamlit charts
+                        # Auto chart
                         numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
                         if numeric_cols and len(result_df) > 1:
                             if 'YEAR' in result_df.columns:
-                                st.line_chart(result_df.set_index('YEAR')[numeric_cols[0]])
+                                fig = px.line(result_df, x='YEAR', y=numeric_cols[0])
+                                fig.update_layout(
+                                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                                    font=dict(color=T['plotly_text']),
+                                    xaxis=dict(gridcolor=T['plotly_grid']),
+                                    yaxis=dict(gridcolor=T['plotly_grid']),
+                                    margin=dict(l=10, r=10, t=20, b=10), height=300
+                                )
+                                fig.update_traces(line_color=T['gold'])
+                                st.plotly_chart(fig, use_container_width=True)
                             elif 'TICKER' in result_df.columns and len(result_df) <= 20:
-                                st.bar_chart(result_df.set_index('TICKER')[numeric_cols[0]])
+                                fig = px.bar(result_df, x='TICKER', y=numeric_cols[0],
+                                           color_discrete_sequence=[T['gold']])
+                                fig.update_layout(
+                                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                                    font=dict(color=T['plotly_text']),
+                                    xaxis=dict(gridcolor=T['plotly_grid']),
+                                    yaxis=dict(gridcolor=T['plotly_grid']),
+                                    margin=dict(l=10, r=10, t=20, b=10), height=300
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
 
                         # AI insight
                         insight_prompt = f"""You are a senior financial analyst at Goldman Sachs.
