@@ -477,7 +477,7 @@ with nav_col1:
     """, unsafe_allow_html=True)
 
 with nav_col2:
-    nav_options = ["📊 Analysis", " Research"]
+    nav_options = ["📊 Analysis", "🔬 Research"]
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "📊 Analysis"
     
