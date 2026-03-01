@@ -517,7 +517,23 @@ current_page = st.session_state.get("nav_page", "📊 Analysis")
 if current_page == "🔬 Research":
     st.markdown("### 🔬 AI Research Terminal")
     st.info("Deep-dive analysis powered by Cortex AI")
-    research_topic = st.text_input("Enter a stock or sector to research deeply", "AAPL")
+    research_topic = st.selectbox(
+        "Select a stock to research deeply",
+        options=[
+            "AAPL","MSFT","GOOGL","GOOG","AMZN","META","NVDA","TSLA","NFLX","AMD",
+            "JPM","BAC","GS","MS","WFC","C","BLK","AXP","V","MA","PYPL","SQ",
+            "JNJ","PFE","UNH","ABBV","MRK","LLY","BMY","AMGN","GILD","CVS",
+            "XOM","CVX","COP","SLB","EOG","MPC","PSX","VLO","OXY","HAL",
+            "WMT","TGT","COST","HD","LOW","NKE","SBUX","MCD","YUM",
+            "BA","CAT","GE","HON","MMM","LMT","RTX","NOC","DE","EMR",
+            "T","VZ","CMCSA","DIS","PARA","WBD","SPOT","SNAP",
+            "INTC","QCOM","TXN","MU","AMAT","LRCX","KLAC","MRVL","AVGO","ARM",
+            "CRM","ORCL","SAP","ADBE","NOW","SNOW","PLTR","DDOG","ZS","CRWD",
+            "SPY","QQQ","DIA","IWM","VTI","GLD","SLV","USO","TLT","HYG",
+            "BRK.B","IBM","UBER","LYFT","ABNB","DASH","RBLX","U","RIVN","LCID"
+        ],
+        index=0
+    )
     if st.button("🔍 Generate Research Report"):
         with st.spinner("Generating comprehensive research..."):
             try:
