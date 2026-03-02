@@ -1584,7 +1584,7 @@ Available tickers in DB: {', '.join(db_tickers)}
 IMPORTANT: The database contains HISTORICAL data only (roughly 1962 to late 2023). For recent/current prices, the app uses a separate live API — do NOT try to query for dates after 2023.
 User question: {prompt}
 CRITICAL: Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE(). For 'today' or 'this year' queries on the DB, get the MOST RECENT data available instead.
-Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQL. Limit results to 20 rows."""
+Generate ONLY a valid SQL SELECT query. Do NOT output any markdown formatting, backticks, or conversational text (e.g. no "Note:" or explanations). Limit results to 20 rows."""
                             
                             sql_query, _ = call_llm(sql_prompt, "sql_generation")
                             sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
@@ -1643,7 +1643,10 @@ DataFrame 'df' has columns: {', '.join(result_df.columns)}
 Column types: {col_dtypes}
 Write ONLY a single line of Python code that modifies 'df' to answer the user's question (e.g. sorting, getting top N).
 Return ONLY the code. No markdown, no explanations. 
-IMPORTANT: Do NOT use .str accessors on non-string columns. DATE is datetime64, numeric columns are float64.
+IMPORTANT RULES:
+1. Do NOT use .str accessors on non-string columns. DATE is datetime64, numeric columns are float64.
+2. Do NOT invent new column names. You can ONLY use the columns listed above.
+3. If the user asks for "share price" or "price", use the 'CLOSE' column.
 If no filtering/sorting is needed, return EXACTLY: df
 Example: df.nlargest(5, 'HIGH')
 Example: df[df['DATE'] >= '2023-01-01']
@@ -1654,6 +1657,7 @@ Your code:"""
                             if filter_code and filter_code != "df":
                                 try:
                                     # Safe evaluation context
+                                    original_df = result_df.copy()
                                     local_env = {"df": result_df.copy(), "pd": pd}
                                     exec(f"filtered_df = {filter_code}", {}, local_env)
                                     import numpy as np
@@ -1662,6 +1666,9 @@ Your code:"""
                                         result_df = result_df.to_frame()
                                     elif isinstance(result_df, (int, float, str, np.number)):
                                         result_df = pd.DataFrame({"Result": [result_df]})
+                                        
+                                    if result_df.empty and not original_df.empty:
+                                        result_df = original_df # Fallback if AI filtering aggressively deleted everything
                                         
                                     with st.expander("🛠️ Data Transformation"):
                                         st.code(filter_code, language="python")
