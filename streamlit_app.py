@@ -1581,8 +1581,9 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
 Database: FINANCE_AI_DB.STOCK_DATA.PRICES
 Columns: date (DATE), ticker (VARCHAR), open (FLOAT), high (FLOAT), low (FLOAT), close (FLOAT), volume (FLOAT), adj_close (FLOAT)
 Available tickers in DB: {', '.join(db_tickers)}
+IMPORTANT: The database contains HISTORICAL data only (roughly 1962 to late 2023). For recent/current prices, the app uses a separate live API — do NOT try to query for dates after 2023.
 User question: {prompt}
-CRITICAL: Use ONLY Snowflake SQL syntax. For dates, use CURRENT_DATE() instead of CURDATE(), and DATE_FROM_PARTS() instead of MAKEDATE().
+CRITICAL: Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE(). For 'today' or 'this year' queries on the DB, get the MOST RECENT data available instead.
 Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQL. Limit results to 20 rows."""
                             
                             sql_query, _ = call_llm(sql_prompt, "sql_generation")
@@ -1596,8 +1597,23 @@ Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQ
                         
                         if api_dfs:
                             api_combined = pd.concat(api_dfs, ignore_index=True)
+                            # Normalize DATE columns to pd.Timestamp to prevent type mismatch
+                            if 'DATE' in api_combined.columns:
+                                api_combined['DATE'] = pd.to_datetime(api_combined['DATE'], errors='coerce')
+                            if not result_df.empty and 'DATE' in result_df.columns:
+                                result_df['DATE'] = pd.to_datetime(result_df['DATE'], errors='coerce')
+                            
                             if result_df.empty:
                                 result_df = api_combined
+                            else:
+                                # ALWAYS merge API data with DB data for combined sources
+                                # This ensures queries like "top 5 all time" include 2024-2025 data
+                                common_cols = list(set(result_df.columns) & set(api_combined.columns))
+                                if common_cols:
+                                    result_df = pd.concat([result_df, api_combined[common_cols]], ignore_index=True)
+                                    if 'DATE' in result_df.columns and 'TICKER' in result_df.columns:
+                                        result_df = result_df.drop_duplicates(subset=['DATE', 'TICKER'], keep='last')
+                                    result_df = result_df.sort_values('DATE', ascending=False).reset_index(drop=True) if 'DATE' in result_df.columns else result_df
                         
                         if len(result_df) > 0:
                             # Handle quarterly aggregation explicitly
@@ -1620,11 +1636,14 @@ Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQ
                                     st.warning(f"Quarterly aggregation error: {e}")
                             
                             # Apply AI-driven filtering/sorting based on user prompt (e.g. "top 5 highest")
+                            col_dtypes = {col: str(result_df[col].dtype) for col in result_df.columns}
                             filter_prompt = f"""You are a Python Pandas expert.
 User asked: {prompt}
 DataFrame 'df' has columns: {', '.join(result_df.columns)}
+Column types: {col_dtypes}
 Write ONLY a single line of Python code that modifies 'df' to answer the user's question (e.g. sorting, getting top N).
 Return ONLY the code. No markdown, no explanations. 
+IMPORTANT: Do NOT use .str accessors on non-string columns. DATE is datetime64, numeric columns are float64.
 If no filtering/sorting is needed, return EXACTLY: df
 Example: df.nlargest(5, 'HIGH')
 Example: df[df['DATE'] >= '2023-01-01']
@@ -1647,7 +1666,7 @@ Your code:"""
                                     with st.expander("🛠️ Data Transformation"):
                                         st.code(filter_code, language="python")
                                 except Exception as e:
-                                    st.warning(f"Could not apply specific filter: {e}")
+                                    pass  # Silent: unfiltered data still renders correctly
 
                             st.dataframe(result_df, use_container_width=True)
                             
