@@ -1403,7 +1403,7 @@ if "messages" not in st.session_state:
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.markdown(message["content"], unsafe_allow_html=True)
         if message.get("sql"):
             with st.expander("🔍 Generated SQL"):
                 st.code(message["sql"], language="sql")
@@ -1645,26 +1645,16 @@ Your code:"""
                             numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
                             if show_chart and len(numeric_cols) > 0 and not result_df.empty:
                                 try:
-                                    chart_x = 'DATE' if 'DATE' in result_df.columns else ('YEAR' if 'YEAR' in result_df.columns else None)
-                                    if chart_x:
-                                        color_col = 'TICKER' if 'TICKER' in result_df.columns and result_df['TICKER'].nunique() > 1 else None
-                                        fig = px.line(result_df, x=chart_x, y=numeric_cols[0], color=color_col)
-                                        fig.update_layout(
-                                            paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                                            font=dict(color=T['plotly_text']),
-                                            xaxis=dict(gridcolor=T['plotly_grid']),
-                                            yaxis=dict(gridcolor=T['plotly_grid']),
-                                            margin=dict(l=10, r=10, t=20, b=10), height=300)
-                                        st.plotly_chart(fig, use_container_width=True)
-                                    elif 'TICKER' in result_df.columns and len(result_df) <= 20:
-                                        fig = px.bar(result_df, x='TICKER', y=numeric_cols[0], color_discrete_sequence=[T['gold']])
-                                        fig.update_layout(
-                                            paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                                            font=dict(color=T['plotly_text']),
-                                            xaxis=dict(gridcolor=T['plotly_grid']),
-                                            yaxis=dict(gridcolor=T['plotly_grid']),
-                                            margin=dict(l=10, r=10, t=20, b=10), height=300)
-                                        st.plotly_chart(fig, use_container_width=True)
+                                    chart_x = 'DATE' if 'DATE' in result_df.columns else ('YEAR' if 'YEAR' in result_df.columns else result_df.index)
+                                    color_col = 'TICKER' if 'TICKER' in result_df.columns and result_df['TICKER'].nunique() > 1 else None
+                                    fig = px.line(result_df, x=chart_x, y=numeric_cols[0], color=color_col)
+                                    fig.update_layout(
+                                        paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                                        font=dict(color=T['plotly_text']),
+                                        xaxis=dict(gridcolor=T['plotly_grid']),
+                                        yaxis=dict(gridcolor=T['plotly_grid']),
+                                        margin=dict(l=10, r=10, t=20, b=10), height=300)
+                                    st.plotly_chart(fig, use_container_width=True)
                                 except Exception as e:
                                     st.warning(f"Could not generate chart: {e}")
                             
