@@ -1627,9 +1627,13 @@ Your code:"""
                                     # Safe evaluation context
                                     local_env = {"df": result_df.copy(), "pd": pd}
                                     exec(f"filtered_df = {filter_code}", {}, local_env)
+                                    import numpy as np
                                     result_df = local_env.get("filtered_df", result_df)
                                     if isinstance(result_df, pd.Series):
                                         result_df = result_df.to_frame()
+                                    elif isinstance(result_df, (int, float, str, np.number)):
+                                        result_df = pd.DataFrame({"Result": [result_df]})
+                                        
                                     with st.expander("🛠️ Data Transformation"):
                                         st.code(filter_code, language="python")
                                 except Exception as e:
