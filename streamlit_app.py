@@ -1628,6 +1628,8 @@ Your code:"""
                                     local_env = {"df": result_df.copy(), "pd": pd}
                                     exec(f"filtered_df = {filter_code}", {}, local_env)
                                     result_df = local_env.get("filtered_df", result_df)
+                                    if isinstance(result_df, pd.Series):
+                                        result_df = result_df.to_frame()
                                     with st.expander("🛠️ Data Transformation"):
                                         st.code(filter_code, language="python")
                                 except Exception as e:
