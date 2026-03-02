@@ -870,6 +870,18 @@ def smart_data_router(tickers, fmp_key):
                             "error": None
                         }
                     else:
+                        if yfinance_available:
+                            yf_df, yf_err = fetch_yahoo_data(ticker)
+                            if yf_err is None and len(yf_df) > 0:
+                                results[ticker] = {
+                                    "source": "combined",
+                                    "badge": "🔄 COMBINED (YAHOO)",
+                                    "last_date": last_date,
+                                    "rows": row_count,
+                                    "api_data": yf_df,
+                                    "error": None
+                                }
+                                continue
                         results[ticker] = {
                             "source": "database",
                             "badge": "📊 HISTORICAL",
@@ -1538,9 +1550,6 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                                 api_dfs.append(info["api_data"])
                         else:
                             badges_html += f'<span class="badge-historical">📊 {ticker}: HISTORICAL</span> '
-                        
-                        if info.get("error") and info["source"] != "not_found":
-                            st.warning(f"⚠️ {ticker}: {info['error']} — using database data")
                     
                     for msg in not_found_msgs:
                         st.markdown(msg)
@@ -1573,6 +1582,7 @@ Database: FINANCE_AI_DB.STOCK_DATA.PRICES
 Columns: date (DATE), ticker (VARCHAR), open (FLOAT), high (FLOAT), low (FLOAT), close (FLOAT), volume (FLOAT), adj_close (FLOAT)
 Available tickers in DB: {', '.join(db_tickers)}
 User question: {prompt}
+CRITICAL: Use ONLY Snowflake SQL syntax. For dates, use CURRENT_DATE() instead of CURDATE(), and DATE_FROM_PARTS() instead of MAKEDATE().
 Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQL. Limit results to 20 rows."""
                             
                             sql_query, _ = call_llm(sql_prompt, "sql_generation")
