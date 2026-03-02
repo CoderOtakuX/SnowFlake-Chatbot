@@ -1577,23 +1577,48 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                         
                         if db_tickers and snowflake_available:
                             tickers_str_q = ", ".join([f"'{t}'" for t in db_tickers])
+                            # Dynamic LIMIT based on ticker count for time-series
+                            per_ticker_limit = 300
+                            dynamic_limit = len(db_tickers) * per_ticker_limit
                             sql_prompt = f"""You are a SQL expert analyzing stock market data.
 Database: FINANCE_AI_DB.STOCK_DATA.PRICES
 Columns: date (DATE), ticker (VARCHAR), open (FLOAT), high (FLOAT), low (FLOAT), close (FLOAT), volume (FLOAT), adj_close (FLOAT)
 Available tickers in DB: {', '.join(db_tickers)}
 IMPORTANT: The database contains HISTORICAL data only (roughly 1962 to late 2023). For recent/current prices, the app uses a separate live API — do NOT try to query for dates after 2023.
 User question: {prompt}
-CRITICAL: Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE(). For 'today' or 'this year' queries on the DB, get the MOST RECENT data available instead.
-Generate ONLY a valid SQL SELECT query. Do NOT output any markdown formatting, backticks, or conversational text (e.g. no "Note:" or explanations). Limit results to 20 rows."""
+CRITICAL RULES:
+1. Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE().
+2. Generate EXACTLY ONE SQL SELECT statement. No semicolons. No UNION. No multiple queries.
+3. Do NOT output any markdown, backticks, or conversational text (no "Note:", no explanations).
+4. For 'today' or 'this year', get the MOST RECENT data available.
+5. For multi-stock comparisons, use WHERE ticker IN ('TICK1','TICK2',...) — do NOT use separate queries.
+6. For time-series queries (trends, performance, comparison over time): return raw daily rows with date, ticker, and price columns. Do NOT aggregate into a single row per ticker. Use ORDER BY date and LIMIT {dynamic_limit}.
+7. For non-time-series queries, LIMIT results to 50 rows.
+Generate the SQL now:"""
                             
                             sql_query, _ = call_llm(sql_prompt, "sql_generation")
                             sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                            # Sanitize: ensure exactly 1 statement
+                            if ';' in sql_query:
+                                sql_query = sql_query.split(';')[0].strip()
+                            # Strip any trailing conversational text (lines not starting with SQL keywords)
+                            sql_lines = sql_query.split('\n')
+                            sql_keywords = ('SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'ORDER', 'GROUP', 'HAVING', 'LIMIT', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'ON', 'AS', 'WITH', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', ')', '(', ',', 'UNION', 'BETWEEN', 'IN', 'NOT', 'LIKE', 'IS', 'NULL', 'ASC', 'DESC', 'DISTINCT', 'COUNT', 'SUM', 'AVG', 'MAX', 'MIN', 'OVER', 'PARTITION', 'ROW_NUMBER', 'LAG', 'LEAD')
+                            clean_lines = []
+                            for line in sql_lines:
+                                stripped = line.strip().upper()
+                                if stripped and (stripped.startswith(sql_keywords) or stripped.startswith('--') or any(stripped.startswith(kw) for kw in sql_keywords)):
+                                    clean_lines.append(line)
+                                elif stripped and clean_lines:  # continuation lines (column names, etc.)
+                                    clean_lines.append(line)
+                            if clean_lines:
+                                sql_query = '\n'.join(clean_lines)
                             with st.expander("🔍 Generated SQL"):
                                 st.code(sql_query, language="sql")
                             try:
                                 result_df = run_query(sql_query)
                             except Exception as sql_err:
-                                st.warning(f"SQL query error: {sql_err}")
+                                pass  # Silent: API data fallback will handle this
                         
                         if api_dfs:
                             api_combined = pd.concat(api_dfs, ignore_index=True)
@@ -1677,22 +1702,25 @@ Your code:"""
 
                             st.dataframe(result_df, use_container_width=True)
                             
-                            show_chart = any(word in prompt.lower() for word in ['graph', 'chart', 'trend', 'plot', 'visual'])
+                            show_chart = any(word in prompt.lower() for word in ['graph', 'chart', 'trend', 'plot', 'visual', 'compare', 'comparison', 'performance', 'show', 'over time', 'growth', 'return', 'annual'])
                             numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-                            if show_chart and len(numeric_cols) > 0 and not result_df.empty:
+                            # Prefer CLOSE column for y-axis if available
+                            chart_y = 'CLOSE' if 'CLOSE' in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+                            if show_chart and chart_y and not result_df.empty:
                                 try:
                                     chart_x = 'DATE' if 'DATE' in result_df.columns else ('YEAR' if 'YEAR' in result_df.columns else result_df.index)
                                     color_col = 'TICKER' if 'TICKER' in result_df.columns and result_df['TICKER'].nunique() > 1 else None
-                                    fig = px.line(result_df, x=chart_x, y=numeric_cols[0], color=color_col)
+                                    fig = px.line(result_df.sort_values('DATE') if 'DATE' in result_df.columns else result_df, x=chart_x, y=chart_y, color=color_col,
+                                                  title=f"{'vs '.join(result_df['TICKER'].unique()) if color_col else ''} Price Trend")
                                     fig.update_layout(
                                         paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
                                         font=dict(color=T['plotly_text']),
                                         xaxis=dict(gridcolor=T['plotly_grid']),
                                         yaxis=dict(gridcolor=T['plotly_grid']),
-                                        margin=dict(l=10, r=10, t=20, b=10), height=300)
+                                        margin=dict(l=10, r=10, t=40, b=10), height=400)
                                     st.plotly_chart(fig, use_container_width=True)
                                 except Exception as e:
-                                    st.warning(f"Could not generate chart: {e}")
+                                    pass  # Silent chart error
                             
                             data_summary = result_df.head(10).to_string()
                             source_note = "Data includes live API data." if has_api_data else "Data from historical database."
