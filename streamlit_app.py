@@ -580,17 +580,28 @@ def fetch_live_data(ticker, api_key, period="1y"):
         quote_url = "https://financialmodelingprep.com/stable/quote"
         resp = requests.get(quote_url, params={"symbol": ticker.upper(), "apikey": api_key}, timeout=10)
         
-        if resp.status_code == 429:
-            return pd.DataFrame(), "API rate limit reached (250 calls/day)"
-        if resp.status_code == 402:
+        if resp.status_code in (429, 402, 403):
+            # FMP blocked (rate limit, premium required, or forbidden) — try Yahoo fallback
+            if yfinance_available:
+                yf_df, yf_err = fetch_yahoo_data(ticker)
+                if yf_err is None and len(yf_df) > 0:
+                    return yf_df, None  # Yahoo succeeded silently
             return pd.DataFrame(), f"FMP API: '{ticker.upper()}' requires premium subscription. Free plan only covers major US stocks."
-        if resp.status_code == 403:
-            return pd.DataFrame(), "FMP API: Free tier endpoint not available. Upgrade plan or use database."
         if resp.status_code != 200:
+            # Other HTTP error — try Yahoo fallback
+            if yfinance_available:
+                yf_df, yf_err = fetch_yahoo_data(ticker)
+                if yf_err is None and len(yf_df) > 0:
+                    return yf_df, None
             return pd.DataFrame(), f"API error: {resp.status_code} - {resp.text[:100]}"
         
         data = resp.json()
         if not data or len(data) == 0:
+            # No data from FMP — try Yahoo fallback
+            if yfinance_available:
+                yf_df, yf_err = fetch_yahoo_data(ticker)
+                if yf_err is None and len(yf_df) > 0:
+                    return yf_df, None
             return pd.DataFrame(), f"No data found for {ticker}"
         
         st.session_state.api_calls_today += 1
@@ -613,8 +624,16 @@ def fetch_live_data(ticker, api_key, period="1y"):
         
         return df, None
     except requests.exceptions.Timeout:
+        if yfinance_available:
+            yf_df, yf_err = fetch_yahoo_data(ticker)
+            if yf_err is None and len(yf_df) > 0:
+                return yf_df, None
         return pd.DataFrame(), "Network timeout"
     except Exception as e:
+        if yfinance_available:
+            yf_df, yf_err = fetch_yahoo_data(ticker)
+            if yf_err is None and len(yf_df) > 0:
+                return yf_df, None
         return pd.DataFrame(), str(e)
 
 
@@ -1017,9 +1036,27 @@ with st.sidebar:
     # API Status
     st.markdown("**Data Sources**")
     if fmp_api_key:
-        st.success("🟢 FMP Live Data: Active")
+        # Validate FMP API tier by testing a premium stock
+        try:
+            test_resp = requests.get(
+                "https://financialmodelingprep.com/stable/quote",
+                params={"symbol": "KKR", "apikey": fmp_api_key}, timeout=5
+            )
+            if test_resp.status_code == 200 and test_resp.json():
+                st.success("🟢 FMP API: Premium (all stocks)")
+            elif test_resp.status_code in (402, 403):
+                st.warning("🟡 FMP API: Free tier (using Yahoo fallback for premium stocks)")
+            else:
+                st.warning("🟡 FMP API: Limited (Yahoo fallback active)")
+        except Exception:
+            st.warning("🟡 FMP API: Connection issue (Yahoo fallback active)")
     else:
-        st.error("🔴 FMP Live Data: Offline")
+        st.info("🔵 FMP API: No key — using Yahoo Finance for live data")
+    
+    if yfinance_available:
+        st.success("🟢 Yahoo Finance: Active (free fallback)")
+    else:
+        st.warning("🟡 Yahoo Finance: Not installed")
     
     st.markdown("**AI Models**")
     if groq_available:
@@ -1027,10 +1064,6 @@ with st.sidebar:
     else:
         st.warning("🟡 Groq: Offline → Using Mistral")
     st.success("🟢 Mistral (Cortex): Always Active")
-    if yfinance_available:
-        st.success("🟢 Yahoo Finance: Available")
-    else:
-        st.warning("🟡 Yahoo Finance: Not installed")
     
     st.divider()
     
