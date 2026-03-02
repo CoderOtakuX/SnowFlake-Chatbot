@@ -3,3 +3,5 @@ pandas
 snowflake-connector-python
 plotly
 python-dotenv
+requests
+yfinance

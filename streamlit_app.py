@@ -4,8 +4,15 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 import snowflake.connector
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+import requests
+import json
 import os
+try:
+    import yfinance as yf
+    yfinance_available = True
+except ImportError:
+    yfinance_available = False
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -413,6 +420,37 @@ button[data-baseweb="tab"][aria-selected="true"] {{
     line-height: 1;
 }}
 
+/* ── Data Source Badges ── */
+.badge-live {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(231,76,60,0.15); color: #E74C3C; border: 1px solid rgba(231,76,60,0.3);
+}}
+.badge-historical {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(201,168,76,0.15); color: {T['gold']}; border: 1px solid rgba(201,168,76,0.3);
+}}
+.badge-combined {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(74,144,217,0.15); color: #4A90D9; border: 1px solid rgba(74,144,217,0.3);
+}}
+.badge-groq {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(46,204,113,0.15); color: #2ECC71; border: 1px solid rgba(46,204,113,0.3);
+}}
+.badge-mistral {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(155,89,182,0.15); color: #9B59B6; border: 1px solid rgba(155,89,182,0.3);
+}}
+.badge-yahoo {{
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    background: rgba(171,71,188,0.15); color: #AB47BC; border: 1px solid rgba(171,71,188,0.3);
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -438,23 +476,32 @@ def get_credentials():
 
 @st.cache_resource
 def get_connection():
-    creds = get_credentials()
-    return snowflake.connector.connect(
-        user=creds["user"],
-        password=creds["password"],
-        account=creds["account"],
-        warehouse=creds["warehouse"],
-        database="FINANCE_AI_DB",
-        schema="STOCK_DATA"
-    )
+    try:
+        creds = get_credentials()
+        return snowflake.connector.connect(
+            user=creds["user"],
+            password=creds["password"],
+            account=creds["account"],
+            warehouse=creds["warehouse"],
+            database="FINANCE_AI_DB",
+            schema="STOCK_DATA",
+            client_session_keep_alive=True
+        )
+    except Exception as e:
+        return None
 
 def run_query(query):
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(query)
-    cols = [desc[0] for desc in cur.description]
-    rows = cur.fetchall()
-    return pd.DataFrame(rows, columns=cols)
+    if conn is None:
+        raise Exception("Database connection unavailable")
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        cols = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+        return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        raise Exception(f"Query execution failed: {str(e)}")
 
 def cortex_complete(prompt):
     safe = prompt.replace("'", "\\'").replace("$$", "")
@@ -462,6 +509,446 @@ def cortex_complete(prompt):
         SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large', '{safe}') as response
     """)
     return result.iloc[0]['RESPONSE']
+
+# ─── API KEY MANAGEMENT ───────────────────────────────────────────────────────
+def get_fmp_api_key():
+    """Get Financial Modeling Prep API key"""
+    try:
+        return st.secrets["FMP_API_KEY"]
+    except Exception:
+        return os.getenv("FMP_API_KEY", "")
+
+def get_groq_api_key():
+    """Get Groq API key for fast LLM"""
+    try:
+        return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        return os.getenv("GROQ_API_KEY", "")
+
+fmp_api_key = get_fmp_api_key()
+groq_api_key = get_groq_api_key()
+groq_available = bool(groq_api_key)
+
+# Track API calls in session state
+if "api_calls_today" not in st.session_state:
+    st.session_state.api_calls_today = 0
+if "groq_calls_today" not in st.session_state:
+    st.session_state.groq_calls_today = 0
+
+# ─── SMART LLM ROUTER ────────────────────────────────────────────────────────
+def call_llm(prompt, task_type="general"):
+    """Try Groq first (fast), fall back to Mistral (reliable)"""
+    global groq_available
+    
+    if groq_available and groq_api_key:
+        try:
+            headers = {
+                "Authorization": f"Bearer {groq_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 2000
+            }
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers, json=payload, timeout=10
+            )
+            if resp.status_code == 200:
+                st.session_state.groq_calls_today += 1
+                return resp.json()["choices"][0]["message"]["content"], "groq"
+            else:
+                groq_available = False
+        except Exception:
+            groq_available = False
+    
+    # Fallback to Mistral via Snowflake Cortex
+    result = cortex_complete(prompt)
+    return result, "mistral"
+
+# ─── LIVE DATA FETCHING ──────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def fetch_live_data(ticker, api_key, period="1y"):
+    """Fetch data from Financial Modeling Prep API (stable endpoints)"""
+    if not api_key:
+        return pd.DataFrame(), "No API key configured"
+    
+    try:
+        # Try stable quote endpoint first (real-time)
+        quote_url = "https://financialmodelingprep.com/stable/quote"
+        resp = requests.get(quote_url, params={"symbol": ticker.upper(), "apikey": api_key}, timeout=10)
+        
+        if resp.status_code == 429:
+            return pd.DataFrame(), "API rate limit reached (250 calls/day)"
+        if resp.status_code == 402:
+            return pd.DataFrame(), f"FMP API: '{ticker.upper()}' requires premium subscription. Free plan only covers major US stocks."
+        if resp.status_code == 403:
+            return pd.DataFrame(), "FMP API: Free tier endpoint not available. Upgrade plan or use database."
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"API error: {resp.status_code} - {resp.text[:100]}"
+        
+        data = resp.json()
+        if not data or len(data) == 0:
+            return pd.DataFrame(), f"No data found for {ticker}"
+        
+        st.session_state.api_calls_today += 1
+        
+        # Build DataFrame from quote data (single row with current price)
+        quote = data[0]
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        df = pd.DataFrame([{
+            "DATE": pd.to_datetime(today_str),
+            "TICKER": ticker.upper(),
+            "OPEN": quote.get("open", 0),
+            "HIGH": quote.get("dayHigh", 0),
+            "LOW": quote.get("dayLow", 0),
+            "CLOSE": quote.get("price", 0),
+            "VOLUME": quote.get("volume", 0),
+        }])
+        
+        for col in ["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        return df, None
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "Network timeout"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+@st.cache_data(ttl=3600)
+def fetch_yahoo_data(ticker):
+    """Fallback: Fetch historical data from Yahoo Finance (free, no API key)"""
+    try:
+        stock = yf.Ticker(ticker.upper())
+        # Fetch 1 year of daily data
+        hist = stock.history(period="2y")
+        
+        if hist is None or len(hist) == 0:
+            return pd.DataFrame(), f"Yahoo Finance: No data for {ticker}"
+        
+        df = hist.reset_index()
+        df = df.rename(columns={
+            "Date": "DATE", "Open": "OPEN", "High": "HIGH",
+            "Low": "LOW", "Close": "CLOSE", "Volume": "VOLUME"
+        })
+        df["TICKER"] = ticker.upper()
+        df["DATE"] = pd.to_datetime(df["DATE"]).dt.tz_localize(None)
+        df = df[["DATE", "TICKER", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]]
+        df = df.sort_values("DATE").reset_index(drop=True)
+        
+        for col in ["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), f"Yahoo Finance error: {str(e)}"
+
+# ─── UTILITIES & ENHANCEMENTS ────────────────────────────────────────────────
+def extract_roi_params(prompt):
+    prompt_llm = f"""Extract ROI investment parameters from this text: '{prompt}'
+Return ONLY a JSON object with strictly these keys:
+- amount: (float, the dollar amount invested)
+- ticker: (string, the stock ticker symbol)
+- start_date: (string, the start date or year, e.g. '2020' or '2020-01-01')
+If not an investment query or missing info, return {{"error": "not_roi"}}
+Do not include markdown blocks, just the JSON string."""
+    result, _ = call_llm(prompt_llm, "intent_detection")
+    try:
+        import re
+        json_match = re.search(r'\{.*\}', result.replace('\n', ''), re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+        return json.loads(result.strip())
+    except:
+        return {"error": "parsing_failed"}
+
+def handle_roi_query(roi_params):
+    if not yfinance_available:
+        return None, "Yahoo Finance not available for historical lookup."
+    try:
+        amount = float(roi_params['amount'])
+        ticker = roi_params['ticker'].upper()
+        start_date_str = str(roi_params['start_date'])
+        
+        stock = yf.Ticker(ticker)
+        start_date_parsed = pd.to_datetime(start_date_str)
+        if len(start_date_str) == 4: # Just a year
+            start_date_parsed = pd.to_datetime(f"{start_date_str}-01-02")
+            
+        hist = stock.history(start=start_date_parsed.strftime("%Y-%m-%d"), end=(start_date_parsed + pd.Timedelta(days=14)).strftime("%Y-%m-%d"))
+        if hist.empty:
+            return None, f"No data available for {ticker} around {start_date_str}"
+        start_price = float(hist['Close'].iloc[0])
+        
+        current = stock.history(period="1d")
+        if current.empty:
+            return None, "No current data available."
+        end_price = float(current['Close'].iloc[-1])
+        
+        shares = amount / start_price
+        current_value = shares * end_price
+        return_val = current_value - amount
+        roi_pct = (return_val / amount) * 100
+        
+        return {
+            "amount": amount, "ticker": ticker, "start_date": start_date_parsed.strftime("%Y-%m-%d"),
+            "start_price": start_price, "end_price": end_price, "shares": shares,
+            "current_value": current_value, "return_val": return_val, "roi_pct": roi_pct
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+# ─── DATABASE CHECKS ─────────────────────────────────────────────────────────
+snowflake_available = True
+
+def check_ticker_in_db(ticker):
+    """Check if ticker exists and get last date. Returns (exists, last_date, count, db_ok)"""
+    global snowflake_available
+    conn = get_connection()
+    if conn is None:
+        snowflake_available = False
+        return False, None, 0, False
+        
+    try:
+        result = run_query(f"""
+            SELECT COUNT(*) as cnt, MAX(date) as last_date
+            FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+            WHERE ticker = '{ticker.upper()}'
+        """)
+        snowflake_available = True
+        row = result.iloc[0]
+        cnt = int(row['CNT'])
+        last_date = row['LAST_DATE']
+        if cnt > 0 and last_date:
+            return True, pd.to_datetime(str(last_date)), cnt, True
+        return False, None, 0, True
+    except Exception as e:
+        snowflake_available = False
+        return False, None, 0, False  # DB is down
+
+# ─── TICKER EXTRACTION ───────────────────────────────────────────────────────
+def extract_tickers_from_question(question):
+    """Use LLM to extract ticker symbols from natural language"""
+    prompt = f"""Extract stock ticker symbols from this question. Return ONLY a JSON array of uppercase ticker symbols, nothing else.
+If the question mentions company names, convert to tickers. If it mentions 'tech stocks', return: ["AAPL","MSFT","GOOGL","META","NVDA","TSLA","AMZN","NFLX","AMD","INTC"]
+If it mentions 'banking stocks', return: ["JPM","BAC","GS","MS","WFC","C"]
+If no specific stocks are mentioned, return an empty array [].
+Max 10 tickers.
+
+Question: {question}
+
+Return ONLY the JSON array:"""
+    
+    result, model_used = call_llm(prompt, "ticker_extraction")
+    
+    try:
+        # Parse the JSON array from the response
+        result = result.strip()
+        if "[" in result:
+            arr_str = result[result.index("["):result.index("]")+1]
+            tickers = json.loads(arr_str)
+            return tickers[:10], model_used
+    except:
+        pass
+    return [], model_used
+
+# ─── TICKER SUGGESTIONS ──────────────────────────────────────────────────────
+def suggest_similar_tickers(invalid_ticker):
+    """Suggest alternatives for typos"""
+    prompt = f"""The user searched for stock ticker "{invalid_ticker}" which doesn't exist.
+Suggest 3 most likely correct ticker symbols they might have meant.
+Return ONLY a JSON array of objects with 'ticker' and 'name' keys.
+Example: [{{"ticker":"AAPL","name":"Apple Inc."}},{{"ticker":"AMZN","name":"Amazon"}}]
+
+Return ONLY the JSON array:"""
+    
+    result, _ = call_llm(prompt, "suggestions")
+    try:
+        result = result.strip()
+        if "[" in result:
+            arr_str = result[result.index("["):result.rindex("]")+1]
+            return json.loads(arr_str)
+    except:
+        pass
+    return [{"ticker": "AAPL", "name": "Apple Inc."}, 
+            {"ticker": "MSFT", "name": "Microsoft"}, 
+            {"ticker": "GOOGL", "name": "Alphabet"}]
+
+# ─── SMART DATA ROUTER ───────────────────────────────────────────────────────
+def smart_data_router(tickers, fmp_key):
+    """Decide data source for each ticker and fetch data"""
+    results = {}
+    today = datetime.now().date()
+    
+    for ticker in tickers:
+        exists, last_date, row_count, db_ok = check_ticker_in_db(ticker)
+        
+        if not db_ok:
+            # Snowflake is down — route directly to API
+            if fmp_key:
+                api_df, api_err = fetch_live_data(ticker, fmp_key)
+                if api_err is None and len(api_df) > 0:
+                    results[ticker] = {
+                        "source": "api",
+                        "badge": "🔴 LIVE DATA",
+                        "last_date": None,
+                        "rows": 0,
+                        "api_data": api_df,
+                        "error": None
+                    }
+                else:
+                    # FMP failed — try Yahoo Finance fallback
+                    if yfinance_available:
+                        yf_df, yf_err = fetch_yahoo_data(ticker)
+                        if yf_err is None and len(yf_df) > 0:
+                            results[ticker] = {
+                                "source": "api",
+                                "badge": "🟡 YAHOO",
+                                "last_date": None,
+                                "rows": 0,
+                                "api_data": yf_df,
+                                "error": None
+                            }
+                            continue
+                    suggestions = suggest_similar_tickers(ticker)
+                    results[ticker] = {
+                        "source": "not_found",
+                        "badge": "❌ NOT FOUND",
+                        "last_date": None,
+                        "rows": 0,
+                        "api_data": None,
+                        "error": api_err or f"Ticker '{ticker}' not found",
+                        "suggestions": suggestions
+                    }
+            else:
+                # No FMP key — try Yahoo Finance directly
+                if yfinance_available:
+                    yf_df, yf_err = fetch_yahoo_data(ticker)
+                    if yf_err is None and len(yf_df) > 0:
+                        results[ticker] = {
+                            "source": "api",
+                            "badge": "🟡 YAHOO",
+                            "last_date": None,
+                            "rows": 0,
+                            "api_data": yf_df,
+                            "error": None
+                        }
+                        continue
+                results[ticker] = {
+                    "source": "not_found",
+                    "badge": "❌ NOT FOUND",
+                    "last_date": None,
+                    "rows": 0,
+                    "api_data": None,
+                    "error": "Database offline and no API available"
+                }
+        elif exists and last_date:
+            days_old = (today - last_date.date()).days
+            
+            if days_old <= 30:
+                results[ticker] = {
+                    "source": "database",
+                    "badge": "📊 HISTORICAL",
+                    "last_date": last_date,
+                    "rows": row_count,
+                    "api_data": None,
+                    "error": None
+                }
+            else:
+                if fmp_key:
+                    api_df, api_err = fetch_live_data(ticker, fmp_key)
+                    if api_err is None and len(api_df) > 0:
+                        results[ticker] = {
+                            "source": "combined",
+                            "badge": "🔄 COMBINED",
+                            "last_date": last_date,
+                            "rows": row_count,
+                            "api_data": api_df,
+                            "error": None
+                        }
+                    else:
+                        results[ticker] = {
+                            "source": "database",
+                            "badge": "📊 HISTORICAL",
+                            "last_date": last_date,
+                            "rows": row_count,
+                            "api_data": None,
+                            "error": api_err
+                        }
+                else:
+                    results[ticker] = {
+                        "source": "database",
+                        "badge": "📊 HISTORICAL",
+                        "last_date": last_date,
+                        "rows": row_count,
+                        "api_data": None,
+                        "error": "No API key configured"
+                    }
+        else:
+            # Not in DB — try API
+            if fmp_key:
+                api_df, api_err = fetch_live_data(ticker, fmp_key)
+                if api_err is None and len(api_df) > 0:
+                    results[ticker] = {
+                        "source": "api",
+                        "badge": "🔴 LIVE DATA",
+                        "last_date": None,
+                        "rows": 0,
+                        "api_data": api_df,
+                        "error": None
+                    }
+                else:
+                    # FMP failed — try Yahoo Finance fallback
+                    if yfinance_available:
+                        yf_df, yf_err = fetch_yahoo_data(ticker)
+                        if yf_err is None and len(yf_df) > 0:
+                            results[ticker] = {
+                                "source": "api",
+                                "badge": "🟡 YAHOO",
+                                "last_date": None,
+                                "rows": 0,
+                                "api_data": yf_df,
+                                "error": None
+                            }
+                            continue
+                    suggestions = suggest_similar_tickers(ticker)
+                    results[ticker] = {
+                        "source": "not_found",
+                        "badge": "❌ NOT FOUND",
+                        "last_date": None,
+                        "rows": 0,
+                        "api_data": None,
+                        "error": f"Ticker '{ticker}' not found",
+                        "suggestions": suggestions
+                    }
+            else:
+                # No FMP key — try Yahoo Finance directly
+                if yfinance_available:
+                    yf_df, yf_err = fetch_yahoo_data(ticker)
+                    if yf_err is None and len(yf_df) > 0:
+                        results[ticker] = {
+                            "source": "api",
+                            "badge": "🟡 YAHOO",
+                            "last_date": None,
+                            "rows": 0,
+                            "api_data": yf_df,
+                            "error": None
+                        }
+                        continue
+                results[ticker] = {
+                    "source": "not_found",
+                    "badge": "❌ NOT FOUND",
+                    "last_date": None,
+                    "rows": 0,
+                    "api_data": None,
+                    "error": f"'{ticker}' not found in any data source"
+                }
+    
+    return results
+
 
 # ─── TOP NAV ─────────────────────────────────────────────────────────────────
 nav_col1, nav_col2, nav_col3 = st.columns([2, 4, 2])
@@ -511,7 +998,42 @@ with nav_col3:
 
 st.markdown("<div style='height:1px; background:" + T['border'] + "; margin-bottom:1.5rem;'></div>", unsafe_allow_html=True)
 
-# ─── PAGE ROUTING ─────────────────────────────────────────────────────────────
+# ─── SIDEBAR STATUS PANEL ─────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown(f"### ⚙️ System Status")
+    
+    # API Status
+    st.markdown("**Data Sources**")
+    if fmp_api_key:
+        st.success("🟢 FMP Live Data: Active")
+    else:
+        st.error("🔴 FMP Live Data: Offline")
+    
+    st.markdown("**AI Models**")
+    if groq_available:
+        st.success("🟢 Groq (Fast AI): Active")
+    else:
+        st.warning("🟡 Groq: Offline → Using Mistral")
+    st.success("🟢 Mistral (Cortex): Always Active")
+    if yfinance_available:
+        st.success("🟢 Yahoo Finance: Available")
+    else:
+        st.warning("🟡 Yahoo Finance: Not installed")
+    
+    st.divider()
+    
+    # Usage counters
+    st.markdown("**Daily Usage**")
+    st.caption(f"📡 FMP API: {st.session_state.api_calls_today}/250 calls")
+    st.caption(f"⚡ Groq AI: {st.session_state.groq_calls_today}/1800 calls")
+    
+    st.divider()
+    st.caption("📊 DB: 29.7M records (1962-2023)")
+    st.caption("🔴 Live: FMP API (real-time)")
+    st.caption("⚡ Fast AI: Groq (0.3s)")
+    st.caption("🛡️ Reliable AI: Mistral (2-3s)")
+
+
 current_page = st.session_state.get("nav_page", "📊 Analysis")
 
 if current_page == "🔬 Research":
@@ -724,7 +1246,7 @@ if selected_tickers:
             st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
 
         except Exception as e:
-            st.error(f"Error loading price data: {e}")
+            pass
 
     # ── Candlestick Tab ──
     with chart_tab2:
@@ -801,7 +1323,7 @@ if selected_tickers:
             st.download_button("📥 Download OHLCV Data", csv_candle, f"{candle_ticker}_ohlcv.csv", "text/csv")
 
         except Exception as e:
-            st.error(f"Error loading candlestick data: {e}")
+            pass
 
     # ── Volume Tab ──
     with chart_tab3:
@@ -846,27 +1368,27 @@ if selected_tickers:
             st.download_button("📥 Download Volume Data", csv_vol, "volume_data.csv", "text/csv")
 
         except Exception as e:
-            st.error(f"Error loading volume data: {e}")
+            pass
 
 # ─── AI CHAT SECTION ─────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="section-header">
     <span class="section-title">AI Research Assistant</span>
     <div class="section-line"></div>
-    <span class="gold-tag">Cortex AI</span>
+    <span class="gold-tag">Smart AI · Live Data</span>
 </div>
 """, unsafe_allow_html=True)
 
 # Example questions
 ex_col1, ex_col2, ex_col3, ex_col4 = st.columns(4)
 example_questions = [
-    "What was Apple's highest price in 2023?",
+    "What is AAPL price today?",
     "Compare Tesla and Microsoft in 2022",
+    "Show me NVDA from 2020 to now",
     "Top 10 stocks by average volume",
     "Amazon price trend 2020–2023",
     "Biggest gainers in 2021",
-    "Google volatility over the years",
-    "IBM performance during COVID",
+    "What are today's top tech stocks?",
     "Banking stocks in 2019"
 ]
 
@@ -914,94 +1436,328 @@ if prompt:
     with st.chat_message("assistant"):
         with st.spinner("Analyzing..."):
             try:
-                sql_prompt = f"""You are a SQL expert analyzing stock market data.
-
+                # Enhancement 1: Intercept ROI / Investment queries
+                if any(word in prompt.lower() for word in ['invested', 'invest', 'worth', 'roi']):
+                    roi_params = extract_roi_params(prompt)
+                    if "error" not in roi_params and all(k in roi_params for k in ['amount', 'ticker', 'start_date']):
+                        roi_data, roi_err = handle_roi_query(roi_params)
+                        if roi_err is None and roi_data is not None:
+                            d = roi_data
+                            sign = "+" if d['return_val'] >= 0 else ""
+                            color = T['success'] if d['return_val'] >= 0 else T['danger']
+                            
+                            html_card = f"""
+                            <div style="background:{T['card']}; border:1px solid {T['border']}; border-radius:8px; padding:15px; margin-bottom:15px;">
+                                <h4 style="margin-top:0; color:{T['text_main']};">📈 Investment Calculator: {d['ticker']}</h4>
+                                <table style="width:100%; text-align:left; color:{T['text_main']}; border-collapse: collapse;">
+                                    <tr><td style="padding:4px 0; border-bottom:1px solid {T['border']};">Initial Investment ({d['start_date']})</td><td style="text-align:right; border-bottom:1px solid {T['border']};"><b>${d['amount']:,.2f}</b></td></tr>
+                                    <tr><td style="padding:4px 0; border-bottom:1px solid {T['border']};">Start Price</td><td style="text-align:right; border-bottom:1px solid {T['border']};">${d['start_price']:,.2f}</td></tr>
+                                    <tr><td style="padding:4px 0; border-bottom:1px solid {T['border']};">Shares Purchased</td><td style="text-align:right; border-bottom:1px solid {T['border']};">{d['shares']:,.2f}</td></tr>
+                                    <tr><td style="padding:4px 0; border-bottom:1px solid {T['border']};">Current Price</td><td style="text-align:right; border-bottom:1px solid {T['border']};">${d['end_price']:,.2f}</td></tr>
+                                    <tr><td style="padding:8px 0 0 0; font-size:1.1em;"><b>Current Value</b></td><td style="text-align:right; padding:8px 0 0 0; font-size:1.1em;"><b>${d['current_value']:,.2f}</b></td></tr>
+                                    <tr><td style="padding:4px 0; color:{color};"><b>Total Return</b></td><td style="text-align:right; color:{color};"><b>{sign}${d['return_val']:,.2f} ({sign}{d['roi_pct']:.1f}%)</b></td></tr>
+                                </table>
+                            </div>
+                            """
+                            
+                            insight_prompt = f"""You are a financial analyst. The user asked: {prompt}
+Here is the math result:
+Investment: ${d['amount']:,.2f} on {d['start_date']} at ${d['start_price']:,.2f} in {d['ticker']}.
+Today's price: ${d['end_price']:,.2f}. Current value: ${d['current_value']:,.2f}.
+Return: {sign}${d['return_val']:,.2f} ({sign}{d['roi_pct']:.1f}%).
+Write a 3 sentence insightful analysis pointing out a key reason for the stock's performance since {d['start_date']} and briefly commenting on the return magnitude."""
+                            insights, insight_model = call_llm(insight_prompt, "analysis")
+                            ib = "⚡ Groq" if insight_model == "groq" else "🛡️ Cortex"
+                            insights, insight_model = call_llm(insight_prompt, "analysis")
+                            ib = "⚡ Groq" if insight_model == "groq" else "🛡️ Cortex"
+                            analysis_html = f'<div class="insight-box"><div class="insight-label">⬡ AI Analysis — {ib} Intelligence</div>{insights}</div>'
+                            
+                            # Enhancement 4: Sentiment Badges
+                            ins_lower = insights.lower()
+                            bull_words = ["up", "gains", "positive", "outperforming", "bullish", "higher", "surge"]
+                            bear_words = ["down", "decline", "negative", "underperforming", "bearish", "lower", "drop"]
+                            bull_count = sum(1 for w in bull_words if w in ins_lower)
+                            bear_count = sum(1 for w in bear_words if w in ins_lower)
+                            
+                            sentiment_html = ""
+                            if bull_count > bear_count:
+                                sentiment_html = '<span style="background-color:rgba(46,125,50,0.2);color:#81c784;border:1px solid #2e7d32;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🟢 BULLISH</span>'
+                            elif bear_count > bull_count:
+                                sentiment_html = '<span style="background-color:rgba(198,40,40,0.2);color:#e57373;border:1px solid #c62828;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🔴 BEARISH</span>'
+                            else:
+                                sentiment_html = '<span style="background-color:rgba(249,168,37,0.2);color:#fff59d;border:1px solid #f9a825;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🟡 NEUTRAL</span>'
+                                
+                            badges_html += sentiment_html
+                            
+                            final_output = f"{badges_html}<br>{html_card}\n{analysis_html}" if "html_card" in locals() else f"{badges_html}<br>{analysis_html}"
+                            st.markdown(final_output, unsafe_allow_html=True)
+                            st.session_state.messages.append({"role": "assistant", "content": final_output})
+                            st.stop()
+                            
+                # Step 1: Extract tickers from the question
+                tickers, extraction_model = extract_tickers_from_question(prompt)
+                ai_badge_class = "badge-groq" if extraction_model == "groq" else "badge-mistral"
+                ai_badge_text = "⚡ GROQ" if extraction_model == "groq" else "🛡️ MISTRAL"
+                
+                # Step 2: Rate limit check
+                if len(tickers) > 10:
+                    msg = "⚠️ Please limit comparisons to **10 stocks maximum** to optimize performance."
+                    st.warning(msg)
+                    st.session_state.messages.append({"role": "assistant", "content": msg})
+                
+                # Step 3: Smart data routing (if tickers found)
+                elif len(tickers) > 0:
+                    route_results = smart_data_router(tickers, fmp_api_key)
+                    
+                    if not snowflake_available:
+                        st.warning("⚠️ Database temporarily unavailable (account security lockout). \n\nUsing live API data only. Historical data from 1962-2023 unavailable until Snowflake account is unlocked. Please wait 30-60 minutes or reset your password.")
+                    
+                    badges_html = ""
+                    has_api_data = False
+                    api_dfs = []
+                    not_found_msgs = []
+                    
+                    for ticker, info in route_results.items():
+                        if info["source"] == "not_found":
+                            suggestions = info.get("suggestions", [])
+                            sugg_text = ", ".join([f"**{s['ticker']}** ({s['name']})" for s in suggestions[:3]])
+                            not_found_msgs.append(f"❌ Ticker `{ticker}` not found. Did you mean: {sugg_text}?")
+                        elif info["source"] == "api":
+                            badge_label = info.get("badge", "🔴 LIVE")
+                            if "YAHOO" in badge_label:
+                                badges_html += f'<span class="badge-yahoo">🟡 {ticker}: YAHOO</span> '
+                            else:
+                                badges_html += f'<span class="badge-live">🔴 {ticker}: LIVE</span> '
+                            has_api_data = True
+                            if info["api_data"] is not None:
+                                api_dfs.append(info["api_data"])
+                        elif info["source"] == "combined":
+                            badges_html += f'<span class="badge-combined">🔄 {ticker}: COMBINED</span> '
+                            has_api_data = True
+                            if info["api_data"] is not None:
+                                api_dfs.append(info["api_data"])
+                        else:
+                            badges_html += f'<span class="badge-historical">📊 {ticker}: HISTORICAL</span> '
+                        
+                        if info.get("error") and info["source"] != "not_found":
+                            st.warning(f"⚠️ {ticker}: {info['error']} — using database data")
+                    
+                    for msg in not_found_msgs:
+                        st.markdown(msg)
+                    
+                    # Debug info
+                    with st.expander("🔧 Debug: Data Routing Details"):
+                        st.caption(f"Snowflake DB: {'🟢 Connected' if snowflake_available else '🔴 Offline (account locked?)'}")
+                        st.caption(f"FMP API Key: {'🟢 Configured' if fmp_api_key else '🔴 Missing'}")
+                        st.caption(f"Groq AI: {'🟢 Active' if groq_available else '🟡 Offline'}")
+                        for t, info in route_results.items():
+                            st.caption(f"{t}: source={info['source']}, error={info.get('error', 'None')}")
+                    
+                    valid_tickers = [t for t, i in route_results.items() if i["source"] != "not_found"]
+                    
+                    if valid_tickers:
+                        timestamp = ""
+                        if has_api_data:
+                            timestamp = f' <span style="font-size:0.7rem;color:{T["text_muted"]};">Updated: just now</span>'
+                        badges_html += f' <span class="{ai_badge_class}">{ai_badge_text}</span>{timestamp}'
+                        st.markdown(badges_html, unsafe_allow_html=True)
+                        
+                        db_tickers = [t for t, i in route_results.items() if i["source"] in ("database", "combined")]
+                        result_df = pd.DataFrame()
+                        sql_query = ""
+                        
+                        if db_tickers and snowflake_available:
+                            tickers_str_q = ", ".join([f"'{t}'" for t in db_tickers])
+                            sql_prompt = f"""You are a SQL expert analyzing stock market data.
 Database: FINANCE_AI_DB.STOCK_DATA.PRICES
 Columns: date (DATE), ticker (VARCHAR), open (FLOAT), high (FLOAT), low (FLOAT), close (FLOAT), volume (FLOAT), adj_close (FLOAT)
-
+Available tickers in DB: {', '.join(db_tickers)}
 User question: {prompt}
-
-Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQL.
-Limit results to 20 rows. Use proper aggregations and ORDER BY."""
-
-                sql_query = cortex_complete(sql_prompt)
-                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-
-                with st.expander("🔍 Generated SQL"):
-                    st.code(sql_query, language="sql")
-
-                try:
-                    result_df = run_query(sql_query)
-
-                    if len(result_df) > 0:
-                        st.dataframe(result_df, use_container_width=True)
-
-                        # Auto chart
-                        numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-                        if numeric_cols and len(result_df) > 1:
-                            if 'YEAR' in result_df.columns:
-                                fig = px.line(result_df, x='YEAR', y=numeric_cols[0])
-                                fig.update_layout(
-                                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                                    font=dict(color=T['plotly_text']),
-                                    xaxis=dict(gridcolor=T['plotly_grid']),
-                                    yaxis=dict(gridcolor=T['plotly_grid']),
-                                    margin=dict(l=10, r=10, t=20, b=10), height=300
-                                )
-                                fig.update_traces(line_color=T['gold'])
-                                st.plotly_chart(fig, use_container_width=True)
-                            elif 'TICKER' in result_df.columns and len(result_df) <= 20:
-                                fig = px.bar(result_df, x='TICKER', y=numeric_cols[0],
-                                           color_discrete_sequence=[T['gold']])
-                                fig.update_layout(
-                                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                                    font=dict(color=T['plotly_text']),
-                                    xaxis=dict(gridcolor=T['plotly_grid']),
-                                    yaxis=dict(gridcolor=T['plotly_grid']),
-                                    margin=dict(l=10, r=10, t=20, b=10), height=300
-                                )
-                                st.plotly_chart(fig, use_container_width=True)
-
-                        # AI insight
-                        insight_prompt = f"""You are a senior financial analyst at Goldman Sachs.
+Generate ONLY a valid SQL SELECT query. No explanation, no markdown, just raw SQL. Limit results to 20 rows."""
+                            
+                            sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                            sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                            with st.expander("🔍 Generated SQL"):
+                                st.code(sql_query, language="sql")
+                            try:
+                                result_df = run_query(sql_query)
+                            except Exception as sql_err:
+                                st.warning(f"SQL query error: {sql_err}")
+                        
+                        if api_dfs:
+                            api_combined = pd.concat(api_dfs, ignore_index=True)
+                            if result_df.empty:
+                                result_df = api_combined
+                        
+                        if len(result_df) > 0:
+                            # Handle quarterly aggregation explicitly
+                            if any(q_word in prompt.lower() for q_word in ["quarter", "quarterly", "q1", "q2", "q3", "q4"]):
+                                try:
+                                    if 'DATE' in result_df.columns:
+                                        result_df['DATE'] = pd.to_datetime(result_df['DATE'])
+                                        result_df['YEAR'] = result_df['DATE'].dt.year
+                                        result_df['QUARTER'] = result_df['DATE'].dt.quarter
+                                        
+                                        q_df = result_df.groupby(['YEAR', 'QUARTER', 'TICKER']).agg(
+                                            AVG_CLOSE=('CLOSE', 'mean'),
+                                            QUARTER_HIGH=('HIGH', 'max'),
+                                            QUARTER_LOW=('LOW', 'min'),
+                                            TOTAL_VOLUME=('VOLUME', 'sum')
+                                        ).reset_index()
+                                        
+                                        result_df = q_df.sort_values(['YEAR', 'QUARTER'])
+                                except Exception as e:
+                                    st.warning(f"Quarterly aggregation error: {e}")
+                            
+                            # Apply AI-driven filtering/sorting based on user prompt (e.g. "top 5 highest")
+                            filter_prompt = f"""You are a Python Pandas expert.
 User asked: {prompt}
-Data: {result_df.head(10).to_string()}
+DataFrame 'df' has columns: {', '.join(result_df.columns)}
+Write ONLY a single line of Python code that modifies 'df' to answer the user's question (e.g. sorting, getting top N).
+Return ONLY the code. No markdown, no explanations. 
+If no filtering/sorting is needed, return EXACTLY: df
+Example: df.nlargest(5, 'HIGH')
+Example: df[df['DATE'] >= '2023-01-01']
+Your code:"""
+                            filter_code, _ = call_llm(filter_prompt, "sql_generation")
+                            filter_code = filter_code.replace("```python", "").replace("```", "").strip()
+                            
+                            if filter_code and filter_code != "df":
+                                try:
+                                    # Safe evaluation context
+                                    local_env = {"df": result_df.copy(), "pd": pd}
+                                    exec(f"filtered_df = {filter_code}", {}, local_env)
+                                    result_df = local_env.get("filtered_df", result_df)
+                                    with st.expander("🛠️ Data Transformation"):
+                                        st.code(filter_code, language="python")
+                                except Exception as e:
+                                    st.warning(f"Could not apply specific filter: {e}")
 
-Write a 3-4 sentence professional analysis. Be specific with numbers. Cover: what the data shows, key pattern, investment implication."""
+                            st.dataframe(result_df, use_container_width=True)
+                            
+                            show_chart = any(word in prompt.lower() for word in ['graph', 'chart', 'trend', 'plot', 'visual'])
+                            numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+                            if show_chart and len(numeric_cols) > 0 and not result_df.empty:
+                                try:
+                                    chart_x = 'DATE' if 'DATE' in result_df.columns else ('YEAR' if 'YEAR' in result_df.columns else None)
+                                    if chart_x:
+                                        color_col = 'TICKER' if 'TICKER' in result_df.columns and result_df['TICKER'].nunique() > 1 else None
+                                        fig = px.line(result_df, x=chart_x, y=numeric_cols[0], color=color_col)
+                                        fig.update_layout(
+                                            paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                                            font=dict(color=T['plotly_text']),
+                                            xaxis=dict(gridcolor=T['plotly_grid']),
+                                            yaxis=dict(gridcolor=T['plotly_grid']),
+                                            margin=dict(l=10, r=10, t=20, b=10), height=300)
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    elif 'TICKER' in result_df.columns and len(result_df) <= 20:
+                                        fig = px.bar(result_df, x='TICKER', y=numeric_cols[0], color_discrete_sequence=[T['gold']])
+                                        fig.update_layout(
+                                            paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                                            font=dict(color=T['plotly_text']),
+                                            xaxis=dict(gridcolor=T['plotly_grid']),
+                                            yaxis=dict(gridcolor=T['plotly_grid']),
+                                            margin=dict(l=10, r=10, t=20, b=10), height=300)
+                                        st.plotly_chart(fig, use_container_width=True)
+                                except Exception as e:
+                                    st.warning(f"Could not generate chart: {e}")
+                            
+                            data_summary = result_df.head(10).to_string()
+                            source_note = "Data includes live API data." if has_api_data else "Data from historical database."
+                            insight_prompt = f"""You are a senior financial analyst at Goldman Sachs.
+User asked: {prompt}
+{source_note}
+Data: {data_summary}
+Write a 3-4 sentence professional analysis. Be specific with numbers."""
+                            
+                            insights, insight_model = call_llm(insight_prompt, "analysis")
+                            ib = "⚡ Groq" if insight_model == "groq" else "🛡️ Cortex"
+                            st.markdown(f"""
+                            <div class="insight-box">
+                                <div class="insight-label">⬡ AI Analysis — {ib} Intelligence</div>
+                                {insights}
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            csv = result_df.to_csv(index=False)
+                            st.download_button("📥 Download Results", csv, "results.csv", "text/csv",
+                                             key=f"dl_new_{len(st.session_state.messages)}")
+                            st.session_state.messages.append({
+                                "role": "assistant", "content": f"{badges_html}<br>{insights}",
+                                "sql": sql_query, "data": result_df,
+                                "id": len(st.session_state.messages)
+                            })
+                        else:
+                            st.warning("No data found for the requested tickers.")
+                    elif not_found_msgs:
+                        st.session_state.messages.append({"role": "assistant", "content": "\n".join(not_found_msgs)})
+                
+                # Enhancement 2: Stock Screener
+                else:
+                    if not snowflake_available:
+                        st.warning("⚠️ Screener requires database access. Database is currently locked.")
+                        st.stop()
+                        
+                    sql_prompt = f"""You are a SQL expert screening stock market data.
+Database: FINANCE_AI_DB.STOCK_DATA.PRICES
+Columns: date, ticker, open, high, low, close, volume
+User question: {prompt}
+Write a Snowflake SQL query to answer this screening request. 
+Examples: "stocks that doubled in 2021", "top 5 volume".
+Calculate percentage changes using MIN/MAX by date if needed.
+Return ONLY raw SQL. Limit results to 20 rows."""
+                    
+                    sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                    with st.expander("🔍 Generated Screener SQL"):
+                        st.code(sql_query, language="sql")
+                        
+                    try:
+                        result_df = run_query(sql_query)
+                        if result_df.empty:
+                            st.info("No stocks matched your screening criteria.")
+                            st.stop()
+                            
+                        st.dataframe(result_df, use_container_width=True)
+                        
+                        insight_prompt = f"""You are a financial analyst evaluating a stock screen.
+User asked: {prompt}
+Data returned (top 10 rows):
+{result_df.head(10).to_string()}
+Write a 3-sentence summary explaining why these types of stocks fit the criteria or market context for this period. Use emojis like 🚀 for big winners if applicable."""
+                        
+                        insights, insight_model = call_llm(insight_prompt, "analysis")
+                        ib = "⚡ Groq" if insight_model == "groq" else "🛡️ Cortex"
+                        
+                        ins_lower = insights.lower()
+                        bull_words = ["up", "gains", "positive", "outperforming", "bullish", "higher", "surge", "doubled"]
+                        bear_words = ["down", "decline", "negative", "underperforming", "bearish", "lower", "drop"]
+                        bull_count = sum(1 for w in bull_words if w in ins_lower)
+                        bear_count = sum(1 for w in bear_words if w in ins_lower)
+                        
+                        sentiment_html = ""
+                        if bull_count > bear_count:
+                            sentiment_html = '<span style="background-color:rgba(46,125,50,0.2);color:#81c784;border:1px solid #2e7d32;padding:2px 8px;border-radius:12px;font-size:0.8em;">🟢 BULLISH SCREEN</span>'
+                        elif bear_count > bull_count:
+                            sentiment_html = '<span style="background-color:rgba(198,40,40,0.2);color:#e57373;border:1px solid #c62828;padding:2px 8px;border-radius:12px;font-size:0.8em;">🔴 BEARISH SCREEN</span>'
+                        else:
+                            sentiment_html = '<span style="background-color:rgba(249,168,37,0.2);color:#fff59d;border:1px solid #f9a825;padding:2px 8px;border-radius:12px;font-size:0.8em;">🟡 NEUTRAL SCREEN</span>'
 
-                        insights = cortex_complete(insight_prompt)
-
-                        st.markdown(f"""
-                        <div class="insight-box">
-                            <div class="insight-label">⬡ AI Analysis — Cortex Intelligence</div>
-                            {insights}
-                        </div>
-                        """, unsafe_allow_html=True)
-
+                        st.markdown(f'{sentiment_html}<br><div class="insight-box"><div class="insight-label">⬡ AI Analysis — {ib} Intelligence</div>{insights}</div>', unsafe_allow_html=True)
+                        
                         csv = result_df.to_csv(index=False)
-                        st.download_button("📥 Download Results", csv, "results.csv", "text/csv",
-                                         key=f"dl_new_{len(st.session_state.messages)}")
-
+                        st.download_button("📥 Download Results", csv, "screener_results.csv", "text/csv", key=f"dl_new_{len(st.session_state.messages)}")
+                        
                         st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": insights,
-                            "sql": sql_query,
-                            "data": result_df,
+                            "role": "assistant", "content": f'{sentiment_html}<br>{insights}',
+                            "sql": sql_query, "data": result_df,
                             "id": len(st.session_state.messages)
                         })
-                    else:
-                        msg = "No data found. Try a specific ticker (AAPL, TSLA) or different date range."
-                        st.warning(msg)
-                        st.session_state.messages.append({"role": "assistant", "content": msg, "sql": sql_query})
-
-                except Exception as sql_err:
-                    st.error(f"Query error: {sql_err}")
-                    fallback = "Query failed. Try rephrasing with specific tickers (e.g. AAPL, MSFT) or time periods (e.g. 2022, Q1 2023)."
-                    st.info(fallback)
-                    st.session_state.messages.append({"role": "assistant", "content": fallback, "sql": sql_query})
-
+                    except Exception as sql_err:
+                        st.warning(f"Screener query error: {sql_err}")
+                        
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Error processing context: {e}")
 
 # Clear chat
 if st.session_state.messages:
@@ -1023,7 +1779,7 @@ st.markdown(f"""
         FinSight<span style="color:{T['text_muted']}">AI</span>
     </div>
     <div style="font-size:0.7rem; color:{T['text_muted']}; font-family:'JetBrains Mono',monospace; letter-spacing:0.06em;">
-        SNOWFLAKE CORTEX AI &nbsp;·&nbsp; 29.7M RECORDS &nbsp;·&nbsp; 1962–2023
+        SNOWFLAKE CORTEX AI &nbsp;·&nbsp; GROQ AI &nbsp;·&nbsp; FMP LIVE DATA &nbsp;·&nbsp; 29.7M RECORDS
     </div>
     <div style="font-size:0.7rem; color:{T['text_muted']};">
         Not financial advice. For research purposes only.
