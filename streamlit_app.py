@@ -2094,7 +2094,45 @@ if current_page == "📊 Dashboard":
 
         for msg in st.session_state[comp_chat_key]:
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                st.markdown(msg["content"], unsafe_allow_html=True)
+                
+                # Show SQL query if available
+                if msg.get("sql"):
+                    with st.expander("🔍 Generated SQL"):
+                        st.code(msg["sql"], language="sql")
+                
+                # Show data if available
+                if msg.get("data") is not None:
+                    df = msg["data"]
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # Show chart if time-series
+                    if 'DATE' in df.columns and len(df) > 1:
+                        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+                        chart_y = 'CLOSE' if 'CLOSE' in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+                        
+                        if chart_y:
+                            try:
+                                fig = px.line(df, x='DATE', y=chart_y)
+                                fig.update_layout(
+                                    paper_bgcolor=T['plotly_paper'],
+                                    plot_bgcolor=T['plotly_plot'],
+                                    font=dict(color=T['plotly_text']),
+                                    height=300
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            except:
+                                pass
+                    
+                    # Download button
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download",
+                        csv,
+                        "data.csv",
+                        "text/csv",
+                        key=f"dl_hist_{msg.get('id', id(msg))}"
+                    )
 
         if user_question := st.chat_input(f"Compare {', '.join(compare_tickers)}..."):
             st.session_state[comp_chat_key].append({"role": "user", "content": user_question})
@@ -2103,8 +2141,135 @@ if current_page == "📊 Dashboard":
 
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing..."):
-                    chat_context = build_comparison_chat_context(compare_tickers, comp_df, route_results)
-                    chat_prompt = f"""You are a senior financial analyst helping compare multiple stocks.
+                    # Check if user wants comparative data
+                    needs_data = any(word in user_question.lower() for word in [
+                        'compare', 'performance', 'which', 'better', 'vs', 
+                        'difference', 'chart', 'data', 'show', 'trend'
+                    ])
+                    
+                    if needs_data and len(compare_tickers) > 0:
+                        # Generate comparison SQL
+                        tickers_str = ", ".join([f"'{t}'" for t in compare_tickers])
+                        sql_prompt = f"""Generate SQL to compare these stocks: {', '.join(compare_tickers)}
+
+Database: FINANCE_AI_DB.STOCK_DATA.PRICES
+Columns: date, ticker, open, high, low, close, volume
+
+User question: {user_question}
+
+Generate Snowflake SQL that:
+- Includes data for all tickers: WHERE ticker IN ({tickers_str})
+- Shows comparison metrics (price, returns, volume)
+- For time-series: ORDER BY date, LIMIT 365
+- For aggregates: GROUP BY ticker
+
+Return ONLY SQL, no markdown."""
+
+                        sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                        sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                        
+                        if ';' in sql_query:
+                            sql_query = sql_query.split(';')[0].strip()
+                        
+                        try:
+                            result_df = run_query(sql_query)
+                            
+                            if not result_df.empty:
+                                with st.expander("🔍 Generated SQL"):
+                                    st.code(sql_query, language="sql")
+                                
+                                st.dataframe(result_df, use_container_width=True)
+                                
+                                # Multi-stock chart
+                                if 'DATE' in result_df.columns and 'TICKER' in result_df.columns:
+                                    try:
+                                        fig = px.line(
+                                            result_df,
+                                            x='DATE',
+                                            y='CLOSE',
+                                            color='TICKER',
+                                            title="Stock Comparison"
+                                        )
+                                        fig.update_layout(
+                                            paper_bgcolor=T['plotly_paper'],
+                                            plot_bgcolor=T['plotly_plot'],
+                                            font=dict(color=T['plotly_text']),
+                                            xaxis=dict(gridcolor=T['plotly_grid']),
+                                            yaxis=dict(gridcolor=T['plotly_grid']),
+                                            height=400
+                                        )
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    except:
+                                        pass
+                                
+                                # AI analysis
+                                chat_context = build_comparison_chat_context(compare_tickers, comp_df, route_results, data_sources)
+                                analysis_prompt = f"""You are a portfolio manager comparing stocks.
+
+{chat_context}
+
+User asked: {user_question}
+
+Data retrieved:
+{result_df.head(10).to_string()}
+
+Write a 3-4 sentence comparison analysis with specific numbers."""
+
+                                analysis, model = call_llm(analysis_prompt, "comparison_chat")
+                                badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                                
+                                st.markdown(f"""
+                                <div class="insight-box">
+                                    <div class="insight-label">⬡ Comparison Analysis — {badge}</div>
+                                    {analysis}
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                csv = result_df.to_csv(index=False)
+                                st.download_button(
+                                    "📥 Download",
+                                    csv,
+                                    "comparison.csv",
+                                    "text/csv",
+                                    key=f"dl_comp_{len(st.session_state[comp_chat_key])}"
+                                )
+                                
+                                st.session_state[comp_chat_key].append({
+                                    "role": "assistant",
+                                    "content": analysis,
+                                    "sql": sql_query,
+                                    "data": result_df
+                                })
+                                
+                        except Exception as e:
+                            # Fallback to simple comparison
+                            chat_context = build_comparison_chat_context(compare_tickers, comp_df, route_results, data_sources)
+                            chat_prompt = f"""You are a senior financial analyst helping compare multiple stocks.
+
+{chat_context}
+
+User Question: {user_question}
+
+Provide a clear, insightful answer (3-4 sentences) that:
+1. Directly addresses the question
+2. Uses specific numbers from the data
+3. Compares the stocks against each other
+4. Gives actionable insights
+
+Be professional but conversational."""
+
+                            response, model = call_llm(chat_prompt, "comparison_chat")
+                            badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                            st.markdown(f"**{badge}**")
+                            st.markdown(response)
+                            st.session_state[comp_chat_key].append({
+                                "role": "assistant",
+                                "content": f"**{badge}**\n\n{response}"
+                            })
+                    else:
+                        # Simple conversational comparison
+                        chat_context = build_comparison_chat_context(compare_tickers, comp_df, route_results, data_sources)
+                        chat_prompt = f"""You are a senior financial analyst helping compare multiple stocks.
 
 {chat_context}
 
@@ -2118,14 +2283,14 @@ Provide a clear, insightful answer (3-4 sentences) that:
 
 Be professional but conversational. If data is missing, acknowledge it and provide general insights."""
 
-                    response, model = call_llm(chat_prompt, "comparison_chat")
-                    badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
-                    st.markdown(f"**{badge}**")
-                    st.markdown(response)
-                    st.session_state[comp_chat_key].append({
-                        "role": "assistant",
-                        "content": f"**{badge}**\n\n{response}"
-                    })
+                        response, model = call_llm(chat_prompt, "comparison_chat")
+                        badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                        st.markdown(f"**{badge}**")
+                        st.markdown(response)
+                        st.session_state[comp_chat_key].append({
+                            "role": "assistant",
+                            "content": f"**{badge}**\n\n{response}"
+                        })
 
     else:
         # ── Default single-stock view ────────────────────────────────────
