@@ -490,6 +490,109 @@ def get_connection():
     except Exception as e:
         return None
 
+# ─── SMART DATA FETCHER ───────────────────────────────────────────────────────
+def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
+    """
+    Smart data fetcher: tries DB first, falls back to Yahoo Finance API, then FMP API.
+    Returns normalized dataframe with DATE, TICKER, CLOSE columns
+    """
+    import yfinance as yf
+    import requests
+    
+    # Convert dates to datetime
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    
+    # Step 1: Try database first
+    try:
+        db_query = f"""
+            SELECT date, '{ticker}' as ticker, close
+            FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+            WHERE ticker = '{ticker}'
+            AND date >= '{start_date}'
+            AND date <= '{end_date}'
+            ORDER BY date ASC
+        """
+        
+        db_data = run_query(db_query)
+        
+        if db_data is not None and not db_data.empty:
+            # Database has data! Use it
+            db_data.columns = ['DATE', 'TICKER', 'CLOSE']
+            db_data['DATE'] = pd.to_datetime(db_data['DATE'])
+            return db_data, "database"
+            
+    except Exception as e:
+        st.caption(f"⚠️ Database query failed for {ticker}: {e}")
+    
+    # Step 2: Database empty or failed - try Yahoo Finance API
+    try:
+        st.caption(f"🔄 Fetching {ticker} from Yahoo Finance API...")
+        
+        # Use Ticker object (works in all yfinance versions)
+        stock = yf.Ticker(ticker)
+        
+        # Get historical data
+        yf_data = stock.history(
+            start=start_date,
+            end=end_date,
+            interval='1d'
+        )
+        
+        if not yf_data.empty:
+            # Convert to standard format
+            result = pd.DataFrame({
+                'DATE': yf_data.index,
+                'TICKER': ticker,
+                'CLOSE': yf_data['Close'].values
+            })
+            result['DATE'] = pd.to_datetime(result['DATE'])
+            result = result.reset_index(drop=True)
+            
+            st.success(f"✅ {ticker}: Loaded {len(result)} days from Yahoo Finance")
+            return result, "yahoo_api"
+        else:
+            st.warning(f"⚠️ {ticker}: No data from Yahoo Finance for this period")
+            
+    except Exception as e:
+        st.caption(f"⚠️ Yahoo Finance failed for {ticker}: {str(e)}")
+    
+    # Step 3: Both failed - try FMP API as last resort
+    try:
+        st.caption(f"🔄 Trying FMP API for {ticker}...")
+        
+        # Calculate period in days
+        days_diff = (end_dt - start_dt).days
+        
+        # Call FMP API
+        fmp_url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}"
+        params = {
+            'apikey': fmp_api_key,
+            'from': start_date,
+            'to': end_date
+        }
+        
+        response = requests.get(fmp_url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if 'historical' in data and data['historical']:
+                # Convert to dataframe
+                fmp_df = pd.DataFrame(data['historical'])
+                fmp_df = fmp_df.rename(columns={'date': 'DATE', 'close': 'CLOSE'})
+                fmp_df['TICKER'] = ticker
+                fmp_df['DATE'] = pd.to_datetime(fmp_df['DATE'])
+                fmp_df = fmp_df[['DATE', 'TICKER', 'CLOSE']].sort_values('DATE')
+                
+                return fmp_df, "fmp_api"
+                
+    except Exception as e:
+        st.caption(f"⚠️ FMP API also failed for {ticker}")
+    
+    # All sources failed
+    return pd.DataFrame(), "not_found"
+
 def run_query(query):
     conn = get_connection()
     if conn is None:
@@ -981,6 +1084,245 @@ def smart_data_router(tickers, fmp_key):
     return results
 
 
+# ─── DASHBOARD CHART HELPER ──────────────────────────────────────────────────
+def show_stock_chart(ticker, days, theme, route_info):
+    """Display a candlestick + volume chart using combined DB + live Yahoo data."""
+    try:
+        # ── 1. Always fetch real-time history from Yahoo Finance ──
+        yahoo_df = pd.DataFrame()
+        if yfinance_available:
+            try:
+                yf_data, yf_err = fetch_yahoo_data(ticker)
+                if yf_err is None and len(yf_data) > 0:
+                    yahoo_df = yf_data.copy()
+                    yahoo_df.columns = [c.upper() for c in yahoo_df.columns]
+            except Exception:
+                pass
+
+        # ── 2. Also grab API data from route_info (FMP quote) ──
+        api_df = pd.DataFrame()
+        if route_info.get("api_data") is not None and len(route_info["api_data"]) > 0:
+            api_df = route_info["api_data"].copy()
+            api_df.columns = [c.upper() for c in api_df.columns]
+
+        # ── 3. Grab DB data ──
+        db_df = pd.DataFrame()
+        if route_info.get("source") in ("database", "combined"):
+            try:
+                db_df = run_query(f"""
+                    SELECT date, open, high, low, close, volume
+                    FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                    WHERE ticker = '{ticker.upper()}'
+                    ORDER BY date DESC
+                    LIMIT 2000
+                """)
+                if db_df is not None and len(db_df) > 0:
+                    db_df.columns = [c.upper() for c in db_df.columns]
+                else:
+                    db_df = pd.DataFrame()
+            except Exception:
+                db_df = pd.DataFrame()
+
+        # ── 4. Combine all sources (Yahoo preferred for recency) ──
+        frames = [df for df in [db_df, api_df, yahoo_df] if not df.empty]
+        if not frames:
+            st.warning(f"No data available for {ticker}")
+            return
+
+        data = pd.concat(frames, ignore_index=True)
+        data['DATE'] = pd.to_datetime(data['DATE'])
+        data = data.drop_duplicates(subset=['DATE'], keep='last')
+        data = data.sort_values('DATE').reset_index(drop=True)
+
+        # ── 5. Filter: take the last N trading days of available data ──
+        if days is not None:
+            data = data.tail(days)
+
+        if data.empty:
+            st.warning(f"No data available for {ticker} in this period")
+            return
+
+        start_date = data['DATE'].min().strftime('%b %d, %Y')
+        end_date = data['DATE'].max().strftime('%b %d, %Y')
+        st.caption(f"📊 {len(data)} trading days | {start_date} → {end_date}")
+
+        # ── 6. Chart ──
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.04, row_heights=[0.7, 0.3]
+        )
+
+        fig.add_trace(go.Candlestick(
+            x=data['DATE'],
+            open=data['OPEN'], high=data['HIGH'],
+            low=data['LOW'], close=data['CLOSE'],
+            name=ticker,
+            increasing_line_color=theme['green'],
+            decreasing_line_color=theme['red'],
+        ), row=1, col=1)
+
+        vol_colors = [theme['green'] if c >= o else theme['red']
+                      for c, o in zip(data['CLOSE'], data['OPEN'])]
+        fig.add_trace(go.Bar(
+            x=data['DATE'], y=data['VOLUME'],
+            name='Volume', marker_color=vol_colors, opacity=0.5,
+        ), row=2, col=1)
+
+        fig.update_layout(
+            paper_bgcolor=theme['plotly_paper'],
+            plot_bgcolor=theme['plotly_plot'],
+            font=dict(family='DM Sans', color=theme['plotly_text'], size=11),
+            xaxis=dict(gridcolor=theme['plotly_grid']),
+            yaxis=dict(gridcolor=theme['plotly_grid'], title='Price',
+                       tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10)),
+            xaxis2=dict(gridcolor=theme['plotly_grid']),
+            yaxis2=dict(gridcolor=theme['plotly_grid'], title='Volume',
+                        tickfont=dict(family='JetBrains Mono', size=9)),
+            xaxis_rangeslider_visible=False,
+            height=500,
+            margin=dict(l=10, r=10, t=20, b=10),
+            legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=theme['border'], borderwidth=1),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Chart error for {ticker}: {str(e)}")
+
+# ─── SMART TICKER LOOKUP ──────────────────────────────────────────────────
+def smart_ticker_lookup(search_input):
+    """Convert company names or partial matches to valid ticker symbols."""
+    if not search_input:
+        return None
+
+    cleaned = search_input.strip()
+    upper = cleaned.upper()
+
+    # If it looks like a ticker already (1-5 uppercase letters / with dot), return it
+    if cleaned.replace('.', '').isalpha() and len(cleaned) <= 6:
+        return upper
+
+    # Company name → ticker mapping
+    ticker_map = {
+        # Tech
+        'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL',
+        'alphabet': 'GOOGL', 'amazon': 'AMZN', 'meta': 'META',
+        'facebook': 'META', 'nvidia': 'NVDA', 'tesla': 'TSLA',
+        'netflix': 'NFLX', 'amd': 'AMD', 'intel': 'INTC',
+        'adobe': 'ADBE', 'salesforce': 'CRM', 'oracle': 'ORCL',
+        'palantir': 'PLTR', 'snowflake': 'SNOW', 'uber': 'UBER',
+        'spotify': 'SPOT', 'snap': 'SNAP', 'snapchat': 'SNAP',
+        'roblox': 'RBLX', 'shopify': 'SHOP', 'airbnb': 'ABNB',
+        'crowdstrike': 'CRWD', 'datadog': 'DDOG', 'arm': 'ARM',
+        'broadcom': 'AVGO', 'qualcomm': 'QCOM', 'ibm': 'IBM',
+        'taiwan semiconductor': 'TSM', 'tsmc': 'TSM',
+        # Finance
+        'jpmorgan': 'JPM', 'jp morgan': 'JPM', 'chase': 'JPM',
+        'bank of america': 'BAC', 'bofa': 'BAC',
+        'goldman sachs': 'GS', 'goldman': 'GS',
+        'morgan stanley': 'MS', 'visa': 'V', 'mastercard': 'MA',
+        'paypal': 'PYPL', 'square': 'SQ', 'block': 'SQ',
+        'berkshire': 'BRK.B', 'berkshire hathaway': 'BRK.B',
+        'wells fargo': 'WFC', 'citigroup': 'C', 'citi': 'C',
+        'blackrock': 'BLK', 'american express': 'AXP',
+        # Retail / Consumer
+        'walmart': 'WMT', 'target': 'TGT', 'costco': 'COST',
+        'home depot': 'HD', 'lowes': 'LOW', "lowe's": 'LOW',
+        'nike': 'NKE', 'starbucks': 'SBUX', 'mcdonalds': 'MCD',
+        "mcdonald's": 'MCD', 'coca cola': 'KO', 'coca-cola': 'KO',
+        'coke': 'KO', 'pepsi': 'PEP', 'pepsico': 'PEP',
+        'disney': 'DIS', 'walt disney': 'DIS',
+        # Healthcare
+        'johnson': 'JNJ', 'johnson & johnson': 'JNJ', 'j&j': 'JNJ',
+        'unitedhealth': 'UNH', 'pfizer': 'PFE', 'eli lilly': 'LLY',
+        'lilly': 'LLY', 'abbvie': 'ABBV', 'merck': 'MRK',
+        'amgen': 'AMGN', 'gilead': 'GILD', 'moderna': 'MRNA',
+        # Energy
+        'exxon': 'XOM', 'exxonmobil': 'XOM', 'exxon mobil': 'XOM',
+        'chevron': 'CVX', 'conocophillips': 'COP', 'shell': 'SHEL',
+        # Industrial
+        'boeing': 'BA', 'caterpillar': 'CAT', 'ge': 'GE',
+        'general electric': 'GE', 'honeywell': 'HON',
+        'lockheed': 'LMT', 'lockheed martin': 'LMT',
+        # Other
+        'procter': 'PG', 'procter & gamble': 'PG', 'p&g': 'PG',
+        'att': 'T', 'at&t': 'T', 'verizon': 'VZ', 'comcast': 'CMCSA',
+    }
+
+    lower = cleaned.lower()
+
+    # Exact match
+    if lower in ticker_map:
+        return ticker_map[lower]
+
+    # Partial / substring match
+    for name, ticker in ticker_map.items():
+        if lower in name or name in lower:
+            return ticker
+
+    # Fallback: treat input as a ticker symbol
+    return upper
+
+# ─── CHAT CONTEXT BUILDERS ─────────────────────────────────────────────────
+def build_comparison_chat_context(tickers, comp_df, route_results, data_sources=None):
+    """Build detailed context for comparison chatbot."""
+    parts = [f"You are comparing these stocks: {', '.join(tickers)}", "", "CURRENT DATA:"]
+    for _, row in comp_df.iterrows():
+        tk = row['TICKER']
+        price = row['PRICE']
+        return_1y = row['1Y_RETURN']
+        volume = row['VOLUME']
+        
+        # Add data source if available
+        source_info = ""
+        if data_sources and tk in data_sources:
+            source = data_sources[tk]
+            if source == 'yahoo_api':
+                source_info = " (real-time via Yahoo Finance)"
+            elif source == 'fmp_api':
+                source_info = " (real-time via FMP API)"
+            elif source == 'database':
+                source_info = " (historical database)"
+                
+        parts.append(f"- {tk}: ${price:.2f}, 1Y Return: {return_1y:+.2f}%, Volume: {volume:,.0f}{source_info}")
+        
+    parts.append("")
+    parts.append("DATA SOURCES:")
+    for tk in tickers:
+        src = (data_sources.get(tk) if data_sources else None) or route_results.get(tk, {}).get('source', 'unknown')
+        parts.append(f"- {tk}: {src}")
+    parts.append("")
+    try:
+        for tk in tickers:
+            stats = run_query(f"""
+                SELECT MIN(low) as all_time_low, MAX(high) as all_time_high, AVG(close) as avg_price
+                FROM FINANCE_AI_DB.STOCK_DATA.PRICES WHERE ticker = '{tk}' LIMIT 1
+            """)
+            if stats is not None and not stats.empty:
+                r = stats.iloc[0]
+                parts.append(f"{tk} Historical: ATH ${r['ALL_TIME_HIGH']:.2f}, ATL ${r['ALL_TIME_LOW']:.2f}, Avg ${r['AVG_PRICE']:.2f}")
+    except Exception:
+        pass
+    return "\n".join(parts)
+
+def build_single_stock_chat_context(ticker, latest, route_info):
+    """Build detailed context for single-stock chatbot."""
+    parts = [f"Stock: {ticker}", f"Current Price: ${float(latest['CLOSE']):.2f}",
+             f"Open: ${float(latest['OPEN']):.2f}", f"High: ${float(latest['HIGH']):.2f}",
+             f"Low: ${float(latest['LOW']):.2f}", f"Volume: {float(latest['VOLUME']):,.0f}",
+             f"Date: {latest['DATE']}", f"Data Source: {route_info.get('source', 'unknown')}", ""]
+    try:
+        hist = run_query(f"""
+            SELECT MIN(low) as atl, MAX(high) as ath, AVG(close) as avg_price,
+                   MIN(date) as first_date, MAX(date) as last_date
+            FROM FINANCE_AI_DB.STOCK_DATA.PRICES WHERE ticker = '{ticker}'
+        """)
+        if hist is not None and not hist.empty:
+            h = hist.iloc[0]
+            parts.append(f"Historical: ATH ${h['ATH']:.2f}, ATL ${h['ATL']:.2f}, Avg ${h['AVG_PRICE']:.2f}")
+            parts.append(f"Data range: {h['FIRST_DATE']} to {h['LAST_DATE']}")
+    except Exception:
+        pass
+    return "\n".join(parts)
+
 # ─── TOP NAV ─────────────────────────────────────────────────────────────────
 nav_col1, nav_col2, nav_col3 = st.columns([2, 4, 2])
 
@@ -995,7 +1337,7 @@ with nav_col1:
     """, unsafe_allow_html=True)
 
 with nav_col2:
-    nav_options = ["📊 Analysis", "🔬 Research"]
+    nav_options = ["📊 Analysis", "🔬 Research", "📊 Dashboard"]
     if "nav_page" not in st.session_state:
         st.session_state.nav_page = "📊 Analysis"
     
@@ -1138,6 +1480,954 @@ if current_page == "🔬 Research":
                                  f"{research_topic}_research.csv", "text/csv")
             except Exception as e:
                 st.error(f"Error: {e}")
+    st.stop()
+
+if current_page == "📊 Dashboard":
+    st.markdown("### 📊 Stock Intelligence Dashboard")
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        search_input = st.text_input(
+            "🔍 Search Stock Ticker",
+            placeholder="Type ticker symbol (e.g., AAPL, TSLA, GOOGL)...",
+            help="Enter any stock ticker symbol"
+        )
+        st.caption("💡 Popular: AAPL, MSFT, GOOGL, AMZN, META, NVDA, TSLA, NFLX, JPM, TSMC")
+
+    with col2:
+        compare_mode = st.checkbox("Compare Mode", help="Compare multiple stocks side-by-side")
+
+    # Set dashboard_ticker from search input using smart lookup
+    if search_input:
+        dashboard_ticker = smart_ticker_lookup(search_input)
+    else:
+        dashboard_ticker = None
+
+    # Show empty state if no ticker entered
+    if not dashboard_ticker:
+        st.info("👆 Enter a stock ticker symbol to view its dashboard")
+        st.stop()
+
+    if compare_mode:
+        # ── Comparison mode ──────────────────────────────────────────────
+        st.markdown("**🔍 Build Your Comparison**")
+
+        # Initialize comparison list with searched ticker
+        if 'comparison_tickers' not in st.session_state:
+            st.session_state.comparison_tickers = []
+        if dashboard_ticker and dashboard_ticker not in st.session_state.comparison_tickers:
+            st.session_state.comparison_tickers.insert(0, dashboard_ticker)
+
+        col_add, col_list = st.columns([2, 3])
+
+        with col_add:
+            add_ticker = st.text_input(
+                "Add ticker to comparison",
+                placeholder="Type ticker (e.g., KKR, BX, TSMC)...",
+                help="Add any stock ticker symbol",
+                key="comp_add_input"
+            )
+            if add_ticker:
+                add_ticker = smart_ticker_lookup(add_ticker)
+            if st.button("➕ Add to Comparison") and add_ticker:
+                if len(st.session_state.comparison_tickers) >= 4:
+                    st.warning("Maximum 4 stocks allowed")
+                elif add_ticker in st.session_state.comparison_tickers:
+                    st.warning(f"{add_ticker} is already in the list")
+                else:
+                    st.session_state.comparison_tickers.append(add_ticker)
+                    st.rerun()
+
+            # Quick-add popular tickers
+            st.caption("Quick add:")
+            qa1, qa2, qa3, qa4 = st.columns(4)
+            for btn_col, tk in zip([qa1, qa2, qa3, qa4], ["AAPL", "MSFT", "GOOGL", "NVDA"]):
+                with btn_col:
+                    if st.button(tk, key=f"qa_{tk}", use_container_width=True):
+                        if tk not in st.session_state.comparison_tickers and len(st.session_state.comparison_tickers) < 4:
+                            st.session_state.comparison_tickers.append(tk)
+                            st.rerun()
+
+        with col_list:
+            if st.session_state.comparison_tickers:
+                st.markdown("**Stocks in Comparison:**")
+                for i, ticker in enumerate(st.session_state.comparison_tickers):
+                    col_ticker, col_remove = st.columns([3, 1])
+                    with col_ticker:
+                        st.markdown(f"**{i+1}.** {ticker}")
+                    with col_remove:
+                        if st.button("✕", key=f"remove_{ticker}"):
+                            st.session_state.comparison_tickers.remove(ticker)
+                            st.rerun()
+            else:
+                st.caption("No stocks added yet")
+
+        compare_tickers = st.session_state.comparison_tickers
+
+        if len(compare_tickers) < 2:
+            st.info("👆 Add at least 2 stocks to start comparison")
+            st.stop()
+
+        with st.spinner("Fetching comparison data…"):
+            route_results = smart_data_router(compare_tickers, fmp_api_key)
+            comp_rows = []
+            for tk in compare_tickers:
+                info = route_results.get(tk)
+                if info is None or info["source"] == "not_found":
+                    continue
+
+                # Latest price row
+                if info.get("api_data") is not None and len(info["api_data"]) > 0:
+                    row = info["api_data"].iloc[-1]
+                else:
+                    try:
+                        db_row = run_query(f"""
+                            SELECT * FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                            WHERE ticker = '{tk.upper()}' ORDER BY date DESC LIMIT 1
+                        """)
+                        if db_row is None or len(db_row) == 0:
+                            continue
+                        row = db_row.iloc[0]
+                    except Exception:
+                        continue
+
+                price = float(row.get('CLOSE', 0))
+                high  = float(row.get('HIGH', 0))
+                low   = float(row.get('LOW', 0))
+                vol   = float(row.get('VOLUME', 0))
+
+                # 1-year return
+                yr_return = 0.0
+                try:
+                    yr_data = run_query(f"""
+                        SELECT close FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                        WHERE ticker = '{tk.upper()}'
+                          AND date <= DATEADD(day, -365, CURRENT_DATE())
+                        ORDER BY date DESC LIMIT 1
+                    """)
+                    if yr_data is not None and len(yr_data) > 0:
+                        old_price = float(yr_data.iloc[0]['CLOSE'])
+                        if old_price > 0:
+                            yr_return = ((price - old_price) / old_price) * 100
+                except Exception:
+                    pass
+
+                comp_rows.append({
+                    "TICKER": tk.upper(),
+                    "PRICE": price,
+                    "HIGH": high,
+                    "LOW": low,
+                    "VOLUME": vol,
+                    "1Y_RETURN": yr_return,
+                })
+
+        if not comp_rows:
+            st.error("Could not fetch data for the selected tickers.")
+            st.stop()
+
+        comp_df = pd.DataFrame(comp_rows)
+
+        # ── Performance Summary ──────────────────────────────────────────
+        best_performer = comp_df.loc[comp_df['1Y_RETURN'].idxmax()]
+        worst_performer = comp_df.loc[comp_df['1Y_RETURN'].idxmin()]
+
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+
+        with summary_col1:
+            st.markdown(f"""
+            <div style="background:{T['green']}20; padding:1rem; border-radius:8px; border:1px solid {T['green']};">
+                <div style="color:{T['text_muted']}; font-size:0.9rem;">Best Performer</div>
+                <div style="color:{T['green']}; font-size:1.5rem; font-weight:700;">{best_performer['TICKER']}</div>
+                <div style="color:{T['text_primary']}; font-size:1.1rem;">+{best_performer['1Y_RETURN']:.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with summary_col2:
+            avg_return = comp_df['1Y_RETURN'].mean()
+            st.markdown(f"""
+            <div style="background:{T['bg_card']}; padding:1rem; border-radius:8px; border:1px solid {T['border']};">
+                <div style="color:{T['text_muted']}; font-size:0.9rem;">Average Return</div>
+                <div style="color:{T['gold']}; font-size:1.5rem; font-weight:700;">Portfolio</div>
+                <div style="color:{T['text_primary']}; font-size:1.1rem;">{avg_return:+.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with summary_col3:
+            st.markdown(f"""
+            <div style="background:{T['red']}20; padding:1rem; border-radius:8px; border:1px solid {T['red']};">
+                <div style="color:{T['text_muted']}; font-size:0.9rem;">Worst Performer</div>
+                <div style="color:{T['red']}; font-size:1.5rem; font-weight:700;">{worst_performer['TICKER']}</div>
+                <div style="color:{T['text_primary']}; font-size:1.1rem;">{worst_performer['1Y_RETURN']:+.2f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Performance cards ────────────────────────────────────────────
+        card_cols = st.columns(len(comp_df))
+        for idx, (_, r) in enumerate(comp_df.iterrows()):
+            ret = r['1Y_RETURN']
+            arrow = "▲" if ret >= 0 else "▼"
+            ret_color = T['green'] if ret >= 0 else T['red']
+            with card_cols[idx]:
+                st.markdown(f"""
+                <div style="background:{T['bg_card']}; border:1px solid {T['border']};
+                            border-radius:10px; padding:1.2rem 1rem; text-align:center;">
+                    <div style="font-family:'Playfair Display',serif; font-size:1.3rem;
+                                font-weight:700; color:{T['gold']};">{r['TICKER']}</div>
+                    <div style="font-size:2rem; font-weight:700; color:{T['text_primary']};
+                                margin:0.4rem 0;">${r['PRICE']:,.2f}</div>
+                    <div style="font-size:0.95rem; font-weight:600; color:{ret_color};">
+                        {arrow} {abs(ret):.2f}%
+                    </div>
+                    <div style="font-size:0.72rem; color:{T['text_muted']}; margin-top:0.5rem;">
+                        H ${r['HIGH']:,.2f} &nbsp;·&nbsp; L ${r['LOW']:,.2f}
+                    </div>
+                    <div style="font-size:0.72rem; color:{T['text_muted']};">
+                        Vol {r['VOLUME']:,.0f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Comparison Timeline Selector ─────────────────────────────────
+        st.markdown("**📅 Comparison Time Period**")
+        comp_c1, comp_c2, comp_c3, comp_c4, comp_c5 = st.columns(5)
+        with comp_c1:
+            comp_1m = st.button("1M", key="comp_1m", use_container_width=True)
+        with comp_c2:
+            comp_3m = st.button("3M", key="comp_3m", use_container_width=True)
+        with comp_c3:
+            comp_6m = st.button("6M", key="comp_6m", use_container_width=True)
+        with comp_c4:
+            comp_1y = st.button("1Y", key="comp_1y", use_container_width=True, type="primary")
+        with comp_c5:
+            comp_all = st.button("All", key="comp_all", use_container_width=True)
+
+        if 'comp_period' not in st.session_state:
+            st.session_state.comp_period = 365
+        if comp_1m:
+            st.session_state.comp_period = 30
+        elif comp_3m:
+            st.session_state.comp_period = 90
+        elif comp_6m:
+            st.session_state.comp_period = 180
+        elif comp_1y:
+            st.session_state.comp_period = 365
+        elif comp_all:
+            st.session_state.comp_period = None
+
+        st.divider()
+
+        # ── Custom Date Range ────────────────────────────────────────────
+        custom_c1, custom_c2, custom_c3 = st.columns([2, 2, 1])
+        with custom_c1:
+            custom_start = st.date_input(
+                "Custom Start Date",
+                value=pd.Timestamp.now() - pd.Timedelta(days=365),
+                max_value=pd.Timestamp.now(),
+                help="Select custom start date"
+            )
+        with custom_c2:
+            custom_end = st.date_input(
+                "Custom End Date", 
+                value=pd.Timestamp.now(),
+                max_value=pd.Timestamp.now(),
+                help="Select custom end date"
+            )
+        with custom_c3:
+            st.write("") # Spacing
+            st.write("")
+            if st.button("Apply Custom Range", use_container_width=True, type="secondary"):
+                st.session_state.comp_period = "custom"
+                st.session_state.custom_start_date = custom_start
+                st.session_state.custom_end_date = custom_end
+                st.rerun()
+
+        st.divider()
+
+        comp_period_labels = {30: "1M", 90: "3M", 180: "6M", 365: "1Y", None: "All Time"}
+
+        # ── Normalized Price Chart ───────────────────────────────────────
+        st.markdown("**📊 Price Performance Comparison**")
+
+        if 'custom_start_date' in st.session_state and 'custom_end_date' in st.session_state and st.session_state.comp_period == "custom":
+            start_date = st.session_state.custom_start_date
+            end_date = st.session_state.custom_end_date
+            period_label = f"Custom: {start_date} to {end_date}"
+        elif st.session_state.get('comp_period'):
+            end_date = pd.Timestamp.now().date()
+            start_date = end_date - pd.Timedelta(days=st.session_state.comp_period)
+            period_label = comp_period_labels.get(st.session_state.comp_period, "Custom")
+        else:
+            start_date = pd.Timestamp('1980-01-01').date()
+            end_date = pd.Timestamp.now().date()
+            period_label = "All Time"
+            
+        st.markdown(f"**Normalized to 100 ({period_label})**")
+
+        all_price_data = []
+        data_sources = {}
+
+        with st.spinner(f"Loading data for {', '.join(compare_tickers)}..."):
+            progress_text = st.empty()
+            
+            for i, ticker in enumerate(compare_tickers):
+                progress_text.text(f"Loading {ticker}... ({i+1}/{len(compare_tickers)})")
+                
+                ticker_data, source = fetch_comparison_data_smart(
+                    ticker, 
+                    start_date, 
+                    end_date, 
+                    fmp_api_key
+                )
+                
+                if not ticker_data.empty:
+                    first_price = float(ticker_data.iloc[0]['CLOSE'])
+                    if first_price > 0:
+                        ticker_data['NORMALIZED'] = (ticker_data['CLOSE'].astype(float) / first_price) * 100
+                    
+                    all_price_data.append(ticker_data)
+                    data_sources[ticker] = source
+                else:
+                    data_sources[ticker] = "not_found"
+            
+            progress_text.empty()
+
+        # Show data sources
+        st.markdown("**📊 Data Sources:**")
+        source_cols = st.columns(len(compare_tickers))
+
+        source_icons = {
+            'database': '💾 DB',
+            'yahoo_api': '🟡 Yahoo',
+            'fmp_api': '🔴 FMP',
+            'not_found': '❌ None'
+        }
+
+        for i, ticker in enumerate(compare_tickers):
+            with source_cols[i]:
+                source = data_sources.get(ticker, 'not_found')
+                icon = source_icons[source]
+                
+                if source == 'not_found':
+                    st.error(f"{ticker}: {icon}")
+                elif source == 'database':
+                    st.success(f"{ticker}: {icon}")
+                else:
+                    st.info(f"{ticker}: {icon}")
+
+        st.divider()
+
+        # Data Coverage Summary
+        st.markdown("**📊 Data Coverage Details:**")
+        
+        coverage_data = []
+        for ticker in compare_tickers:
+            source = data_sources.get(ticker, 'not_found')
+            
+            if source != 'not_found':
+                ticker_df = next((df for df in all_price_data if df['TICKER'].iloc[0] == ticker), None)
+                
+                if ticker_df is not None:
+                    coverage_data.append({
+                        'Stock': ticker,
+                        'Source': source_icons[source],
+                        'Start Date': ticker_df['DATE'].min().strftime('%Y-%m-%d'),
+                        'End Date': ticker_df['DATE'].max().strftime('%Y-%m-%d'),
+                        'Data Points': len(ticker_df)
+                    })
+
+        if coverage_data:
+            coverage_df = pd.DataFrame(coverage_data)
+            st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+
+        # Prepare download data (only if we have comparison data)
+        if all_price_data:
+            # Combine all stock data
+            combined_for_download = pd.concat(all_price_data)
+            
+            # Format for CSV
+            download_df = combined_for_download.copy()
+            download_df['Date'] = download_df['DATE'].dt.strftime('%Y-%m-%d')
+            download_df = download_df[['Date', 'TICKER', 'CLOSE', 'NORMALIZED']]
+            download_df = download_df.rename(columns={
+                'Date': 'Date',
+                'TICKER': 'Stock',
+                'CLOSE': 'Price',
+                'NORMALIZED': 'Normalized (Base 100)'
+            })
+            
+            csv = download_df.to_csv(index=False)
+            
+            st.download_button(
+                label="📥 Download Comparison Data (CSV)",
+                data=csv,
+                file_name=f"comparison_{'_'.join(compare_tickers)}_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                type="secondary"
+            )
+
+        st.divider()
+
+        if all_price_data:
+            combined_prices = pd.concat(all_price_data)
+
+            fig = px.line(
+                combined_prices,
+                x='DATE',
+                y='NORMALIZED',
+                color='TICKER',
+                labels={'NORMALIZED': 'Normalized Price (Base 100)', 'DATE': 'Date'},
+            )
+
+            fig.update_layout(
+                paper_bgcolor=T['plotly_paper'],
+                plot_bgcolor=T['plotly_plot'],
+                font=dict(family='DM Sans', color=T['plotly_text'], size=12),
+                xaxis=dict(
+                    gridcolor=T['plotly_grid'],
+                    showgrid=True,
+                    title="Date"
+                ),
+                yaxis=dict(
+                    gridcolor=T['plotly_grid'],
+                    showgrid=True,
+                    title="Normalized Price (Base 100)",
+                    zeroline=True,
+                    zerolinecolor=T['border']
+                ),
+                hovermode='x unified',
+                height=500,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1,
+                    bgcolor=T['bg_card'],
+                    bordercolor=T['border'],
+                    borderwidth=1
+                )
+            )
+
+            # Make lines thicker and more visible
+            fig.update_traces(
+                line=dict(width=2.5),
+                marker=dict(size=3)
+            )
+
+            # Add a horizontal reference line at 100
+            fig.add_hline(
+                y=100, 
+                line_dash="dash", 
+                line_color=T['text_muted'],
+                annotation_text="Starting Point (100)",
+                annotation_position="right"
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            actual_start = combined_prices['DATE'].min()
+            actual_end = combined_prices['DATE'].max()
+            actual_days = (actual_end - actual_start).days
+            
+            expected_label = comp_period_labels.get(st.session_state.comp_period, "Custom")
+            
+            st.caption(f"""
+            **📊 Showing {len(combined_prices)} data points**<br>
+            📅 {actual_start.strftime('%b %d, %Y')} → {actual_end.strftime('%b %d, %Y')} ({actual_days} days)<br>
+            🎯 Selected period: {expected_label}
+            """, unsafe_allow_html=True)
+            
+            # Warning if mismatch
+            if st.session_state.comp_period != "custom" and st.session_state.comp_period and abs(actual_days - st.session_state.comp_period) > 30:
+                st.warning(f"⚠️ Expected ~{st.session_state.comp_period} days, got {actual_days} days. May indicate data gaps.")
+
+        else:
+            st.error(f"""
+            ❌ Could not load data for any stocks in the selected period.
+            
+            **Selected Range:** {start_date} → {end_date}
+            
+            **Suggestions:**
+            - Try a different date range
+            - Check if ticker symbols are correct
+            - Verify API keys are configured
+            """)
+
+        st.divider()
+        st.markdown("**📊 Performance Statistics**")
+
+        stats_cols = st.columns(len(compare_tickers))
+
+        for i, ticker in enumerate(compare_tickers):
+            ticker_df = next((df for df in all_price_data if df['TICKER'].iloc[0] == ticker), None)
+            
+            if ticker_df is not None:
+                with stats_cols[i]:
+                    start_price = ticker_df.iloc[0]['CLOSE']
+                    end_price = ticker_df.iloc[-1]['CLOSE']
+                    total_return = ((end_price - start_price) / start_price) * 100
+                    
+                    max_price = ticker_df['CLOSE'].max()
+                    min_price = ticker_df['CLOSE'].min()
+                    volatility = ticker_df['CLOSE'].std()
+                    
+                    st.markdown(f"**{ticker}**")
+                    st.metric("Total Return", f"{total_return:+.2f}%")
+                    st.caption(f"High: ${max_price:.2f}")
+                    st.caption(f"Low: ${min_price:.2f}")
+                    st.caption(f"Volatility: ${volatility:.2f}")
+
+        st.divider()
+
+        # ── Statistics Comparison Table ───────────────────────────────
+        st.markdown("**📊 Statistics Comparison**")
+        stats_list = []
+        for ticker in compare_tickers:
+            try:
+                tstats = run_query(f"""
+                    SELECT
+                        '{ticker}' as ticker,
+                        MIN(low) as all_time_low,
+                        MAX(high) as all_time_high,
+                        AVG(close) as avg_price,
+                        AVG(volume) as avg_volume
+                    FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                    WHERE ticker = '{ticker}'
+                """)
+                if tstats is not None and not tstats.empty:
+                    stats_list.append(tstats.iloc[0])
+            except Exception:
+                pass
+
+        if stats_list:
+            stats_df = pd.DataFrame(stats_list)
+            display_df = pd.DataFrame({
+                'Stock': stats_df['TICKER'],
+                'All-Time High': stats_df['ALL_TIME_HIGH'].apply(lambda x: f"${x:.2f}"),
+                'All-Time Low': stats_df['ALL_TIME_LOW'].apply(lambda x: f"${x:.2f}"),
+                'Avg Price': stats_df['AVG_PRICE'].apply(lambda x: f"${x:.2f}"),
+                'Avg Volume': stats_df['AVG_VOLUME'].apply(lambda x: f"{x:,.0f}")
+            })
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Statistics unavailable")
+
+        # Download button
+        download_df = comp_df.copy()
+        download_df['Date'] = pd.Timestamp.now().strftime('%Y-%m-%d')
+        csv = download_df.to_csv(index=False)
+        col_dl1, col_dl2 = st.columns([1, 4])
+        with col_dl1:
+            st.download_button(
+                label="📥 Download CSV",
+                data=csv,
+                file_name=f"stock_comparison_{'_'.join(compare_tickers)}_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        st.divider()
+
+        # ── Comparison Chatbot ─────────────────────────────────────────
+        st.markdown("**💬 Ask Questions About These Stocks**")
+        st.caption(f"Chat with AI to compare {', '.join(compare_tickers)}. Ask about performance differences, which to buy, risks, sector trends, etc.")
+
+        with st.expander("💡 Try asking...", expanded=False):
+            st.markdown("""
+            **Comparison:**
+            - "Which stock has the best growth potential?"
+            - "Which is more volatile, and why?"
+            - "Which stock is cheaper based on fundamentals?"
+
+            **Investment:**
+            - "If I can only buy one, which should it be and why?"
+            - "What's the biggest risk for each stock?"
+            - "Which has better momentum right now?"
+
+            **Strategy:**
+            - "Should I hold all of these or concentrate on one?"
+            - "How do these stocks correlate with each other?"
+            """)
+
+        comparison_key = "_".join(sorted(compare_tickers))
+        comp_chat_key = f"comparison_chat_{comparison_key}"
+        if comp_chat_key not in st.session_state:
+            st.session_state[comp_chat_key] = []
+
+        # Clear chat button
+        if st.session_state.get(comp_chat_key):
+            _ce, _cc = st.columns([5, 1])
+            with _cc:
+                if st.button("🗑️ Clear", key=f"clear_comp_{comparison_key}", use_container_width=True):
+                    st.session_state[comp_chat_key] = []
+                    st.rerun()
+
+        for msg in st.session_state[comp_chat_key]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if user_question := st.chat_input(f"Compare {', '.join(compare_tickers)}..."):
+            st.session_state[comp_chat_key].append({"role": "user", "content": user_question})
+            with st.chat_message("user"):
+                st.markdown(user_question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing..."):
+                    chat_context = build_comparison_chat_context(compare_tickers, comp_df, route_results)
+                    chat_prompt = f"""You are a senior financial analyst helping compare multiple stocks.
+
+{chat_context}
+
+User Question: {user_question}
+
+Provide a clear, insightful answer (3-4 sentences) that:
+1. Directly addresses the question
+2. Uses specific numbers from the data
+3. Compares the stocks against each other
+4. Gives actionable insights
+
+Be professional but conversational. If data is missing, acknowledge it and provide general insights."""
+
+                    response, model = call_llm(chat_prompt, "comparison_chat")
+                    badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                    st.markdown(f"**{badge}**")
+                    st.markdown(response)
+                    st.session_state[comp_chat_key].append({
+                        "role": "assistant",
+                        "content": f"**{badge}**\n\n{response}"
+                    })
+
+    else:
+        # ── Default single-stock view ────────────────────────────────────
+        st.markdown(f"""
+        <div class="section-header">
+            <span class="section-title">{dashboard_ticker} Intelligence Report</span>
+            <div class="section-line"></div>
+            <span class="gold-tag">Deep Analysis</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        route_info = smart_data_router([dashboard_ticker], fmp_api_key).get(dashboard_ticker, {})
+
+        if route_info.get("source") == "not_found":
+            st.error(f"Stock {dashboard_ticker} not found in database or API.")
+            st.stop()
+
+        if route_info.get("api_data") is not None and len(route_info["api_data"]) > 0:
+            latest = route_info["api_data"].iloc[-1]
+        else:
+            try:
+                db_latest = run_query(f"""
+                    SELECT * FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                    WHERE ticker = '{dashboard_ticker.upper()}'
+                    ORDER BY date DESC LIMIT 1
+                """)
+                if db_latest is not None and len(db_latest) > 0:
+                    latest = db_latest.iloc[0]
+                else:
+                    st.warning("No price data available.")
+                    st.stop()
+            except Exception as e:
+                st.error(f"Error fetching data: {e}")
+                st.stop()
+
+        # ── Metrics Row ──────────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        day_change = float(latest['CLOSE']) - float(latest['OPEN'])
+        day_change_pct = (day_change / float(latest['OPEN'])) * 100 if float(latest['OPEN']) != 0 else 0
+
+        with m1:
+            st.metric("Current Price", f"${latest['CLOSE']:.2f}")
+        with m2:
+            st.metric("Day Change", f"${abs(day_change):.2f}", delta=f"{day_change_pct:+.2f}%")
+        with m3:
+            st.metric("Day High", f"${latest['HIGH']:.2f}")
+        with m4:
+            st.metric("Volume", f"{latest['VOLUME']:,.0f}")
+
+        st.divider()
+
+        # ── Timeline Selector ────────────────────────────────────────────
+        st.markdown("**📅 Select Time Period**")
+        timeline_cols = st.columns(5)
+        with timeline_cols[0]:
+            btn_1w = st.button("1 Week", use_container_width=True, key="single_1w")
+        with timeline_cols[1]:
+            btn_1m = st.button("1 Month", use_container_width=True, key="single_1m")
+        with timeline_cols[2]:
+            btn_6m = st.button("6 Months", use_container_width=True, key="single_6m")
+        with timeline_cols[3]:
+            btn_1y = st.button("1 Year", use_container_width=True, type="primary", key="single_1y")
+        with timeline_cols[4]:
+            btn_all = st.button("All Time", use_container_width=True, key="single_all")
+
+        if 'single_period' not in st.session_state:
+            st.session_state.single_period = 365
+        if btn_1w:
+            st.session_state.single_period = 7
+        elif btn_1m:
+            st.session_state.single_period = 30
+        elif btn_6m:
+            st.session_state.single_period = 180
+        elif btn_1y:
+            st.session_state.single_period = 365
+        elif btn_all:
+            st.session_state.single_period = None
+
+        period_labels = {7: "1 Week", 30: "1 Month", 180: "6 Months", 365: "1 Year", None: "All Time"}
+        current_label = period_labels.get(st.session_state.single_period, "1 Year")
+
+        st.divider()
+
+        # ── Candlestick Chart ────────────────────────────────────────────
+        st.markdown(f"**📈 Price Chart — {current_label}**")
+        
+        # Determine date range for single stock
+        if st.session_state.get('single_period'):
+            end_date = pd.Timestamp.now().date()
+            start_date = end_date - pd.Timedelta(days=st.session_state.single_period)
+        else:
+            start_date = pd.Timestamp('1980-01-01').date()
+            end_date = pd.Timestamp.now().date()
+
+        # Use smart fetcher for single stock too
+        single_data, single_source = fetch_comparison_data_smart(
+            dashboard_ticker,
+            start_date,
+            end_date,
+            fmp_api_key
+        )
+
+        if not single_data.empty:
+            # Show data source badge
+            source_badge = {
+                'database': '💾 Historical Database',
+                'yahoo_api': '🟡 Yahoo Finance (Real-time)',
+                'fmp_api': '🔴 FMP API (Real-time)',
+            }
+            
+            st.caption(f"Data Source: {source_badge.get(single_source, 'Unknown')}")
+            
+            # Update route_info with fetched data source
+            route_info['api_data'] = single_data
+            route_info['source'] = single_source
+            
+            # Now call chart function
+            show_stock_chart(dashboard_ticker, st.session_state.single_period, T, route_info)
+        else:
+            st.error(f"❌ Could not load data for {dashboard_ticker} in selected period")
+
+        st.divider()
+
+        # ── Statistics Section ───────────────────────────────────────────
+        stat_col1, stat_col2 = st.columns(2)
+
+        with stat_col1:
+            st.markdown("**📊 Historical Statistics**")
+            try:
+                stats = run_query(f"""
+                    SELECT
+                        MIN(low)    as all_time_low,
+                        MAX(high)   as all_time_high,
+                        AVG(close)  as avg_price,
+                        AVG(volume) as avg_volume
+                    FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                    WHERE ticker = '{dashboard_ticker}'
+                """)
+                stats_row = stats.iloc[0]
+                st.markdown(f"""
+                <table style="width:100%; color:{T['text_primary']}; font-family:'DM Sans', sans-serif;">
+                    <tr style="border-bottom: 1px solid {T['border']};">
+                        <td style="padding: 8px 0;">All-Time High</td>
+                        <td style="text-align:right; font-weight:600;">${stats_row['ALL_TIME_HIGH']:.2f}</td>
+                    </tr>
+                    <tr style="border-bottom: 1px solid {T['border']};">
+                        <td style="padding: 8px 0;">All-Time Low</td>
+                        <td style="text-align:right; font-weight:600;">${stats_row['ALL_TIME_LOW']:.2f}</td>
+                    </tr>
+                    <tr style="border-bottom: 1px solid {T['border']};">
+                        <td style="padding: 8px 0;">Average Price</td>
+                        <td style="text-align:right;">${stats_row['AVG_PRICE']:.2f}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 8px 0;">Avg Daily Volume</td>
+                        <td style="text-align:right;">{stats_row['AVG_VOLUME']:,.0f}</td>
+                    </tr>
+                </table>
+                """, unsafe_allow_html=True)
+            except Exception:
+                st.caption("Historical stats unavailable")
+
+        with stat_col2:
+            st.markdown("**🎯 Performance Metrics**")
+            try:
+                perf = run_query(f"""
+                    WITH prices AS (
+                        SELECT date, close,
+                               LAG(close, 365) OVER (ORDER BY date) as close_1y_ago,
+                               LAG(close, 30)  OVER (ORDER BY date) as close_1m_ago
+                        FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                        WHERE ticker = '{dashboard_ticker}'
+                    )
+                    SELECT
+                        ((close - close_1y_ago) / close_1y_ago * 100) as return_1y,
+                        ((close - close_1m_ago) / close_1m_ago * 100) as return_1m
+                    FROM prices
+                    WHERE close_1y_ago IS NOT NULL
+                    ORDER BY date DESC
+                    LIMIT 1
+                """)
+                if not perf.empty:
+                    perf_row = perf.iloc[0]
+                    r1y_color = T['green'] if perf_row['RETURN_1Y'] >= 0 else T['red']
+                    r1m_color = T['green'] if perf_row['RETURN_1M'] >= 0 else T['red']
+                    st.markdown(f"""
+                    <table style="width:100%; color:{T['text_primary']}; font-family:'DM Sans', sans-serif;">
+                        <tr style="border-bottom: 1px solid {T['border']};">
+                            <td style="padding: 8px 0;">1-Month Return</td>
+                            <td style="text-align:right; font-weight:700; color:{r1m_color};">
+                                {perf_row['RETURN_1M']:+.2f}%
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 8px 0;">1-Year Return</td>
+                            <td style="text-align:right; font-weight:700; color:{r1y_color};">
+                                {perf_row['RETURN_1Y']:+.2f}%
+                            </td>
+                        </tr>
+                    </table>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.caption("Not enough data for performance metrics")
+            except Exception:
+                st.caption("Performance metrics unavailable")
+
+        st.divider()
+
+        # ── AI Research Report ───────────────────────────────────────────
+        st.markdown("**🤖 AI Research Report**")
+        with st.spinner("Generating deep analysis..."):
+            try:
+                research_data = run_query(f"""
+                    SELECT YEAR(date) as year,
+                           AVG(close) as avg_price,
+                           MAX(high) as year_high,
+                           MIN(low) as year_low
+                    FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                    WHERE ticker = '{dashboard_ticker}'
+                    GROUP BY YEAR(date)
+                    ORDER BY year DESC
+                    LIMIT 5
+                """)
+
+                research_prompt = f"""You are a senior equity research analyst at JPMorgan.
+
+Write a comprehensive research report on {dashboard_ticker}.
+
+Latest Price: ${latest['CLOSE']:.2f}
+Historical Performance (last 5 years):
+{research_data.to_string()}
+
+Structure your report with these sections:
+
+**Executive Summary** (2 sentences: current status, key trend)
+
+**Historical Analysis** (3 sentences: performance patterns over 5 years, volatility assessment, notable events)
+
+**Investment Outlook** (2 sentences: forward-looking view, risk/reward balance)
+
+Be specific with numbers from the data. Use professional Wall Street analyst tone.
+Format with markdown bold for section headers."""
+
+                report, model = call_llm(research_prompt, "research")
+                badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+
+                st.markdown(f"""
+                <div class="insight-box">
+                    <div class="insight-label">⬡ Research Report — {badge} Intelligence</div>
+                    {report}
+                </div>
+                """, unsafe_allow_html=True)
+            except Exception as e:
+                st.caption(f"AI report unavailable: {e}")
+
+        st.divider()
+
+        # ── AI Chatbot ─────────────────────────────────────────────────
+        st.markdown("**💬 Ask Questions About This Stock**")
+        st.caption(f"Chat with AI to learn more about {dashboard_ticker}. Ask about performance, risks, comparison with competitors, etc.")
+
+        with st.expander("💡 Try asking...", expanded=False):
+            st.markdown(f"""
+            **Performance:**
+            - "How has {dashboard_ticker} performed compared to the market?"
+            - "Is {dashboard_ticker} overvalued or undervalued right now?"
+            - "What's the main catalyst for {dashboard_ticker}'s recent move?"
+
+            **Investment:**
+            - "Should I buy {dashboard_ticker} at the current price?"
+            - "What are the top 3 risks for {dashboard_ticker}?"
+            - "Compare {dashboard_ticker} to its main competitors"
+
+            **Technical:**
+            - "What's the support and resistance levels for {dashboard_ticker}?"
+            - "Is {dashboard_ticker} showing bullish or bearish momentum?"
+            """)
+
+        chat_key = f"chat_history_{dashboard_ticker}"
+        if chat_key not in st.session_state:
+            st.session_state[chat_key] = []
+
+        # Clear chat button
+        if st.session_state.get(chat_key):
+            _se, _sc = st.columns([5, 1])
+            with _sc:
+                if st.button("🗑️ Clear", key=f"clear_single_{dashboard_ticker}", use_container_width=True):
+                    st.session_state[chat_key] = []
+                    st.rerun()
+
+        for msg in st.session_state[chat_key]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        if user_question := st.chat_input(f"Ask about {dashboard_ticker}..."):
+            st.session_state[chat_key].append({"role": "user", "content": user_question})
+            with st.chat_message("user"):
+                st.markdown(user_question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    chat_context = build_single_stock_chat_context(dashboard_ticker, latest, route_info)
+                    chat_prompt = f"""You are an expert financial analyst assistant specialized in stock analysis.
+
+{chat_context}
+
+User Question: {user_question}
+
+Provide a comprehensive answer (3-4 sentences) that:
+1. Directly answers the question with specifics
+2. References actual data points and numbers
+3. Provides context (historical perspective, sector trends, comparisons)
+4. Gives actionable insights or recommendations when relevant
+
+Be professional, accurate, and helpful. If you need data not provided, acknowledge it and give the best general guidance."""
+
+                    response, model = call_llm(chat_prompt, "chat")
+                    badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+
+                    st.markdown(f"**{badge}**")
+                    st.markdown(response)
+
+                    st.session_state[chat_key].append({
+                        "role": "assistant",
+                        "content": f"**{badge}**\n\n{response}"
+                    })
+
     st.stop()
 
 # If current_page == "📊 Analysis" just continue with the rest of the existing code below normally
