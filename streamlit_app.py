@@ -2418,7 +2418,45 @@ Format with markdown bold for section headers."""
 
         for msg in st.session_state[chat_key]:
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                st.markdown(msg["content"], unsafe_allow_html=True)
+                
+                # Show SQL query if available
+                if msg.get("sql"):
+                    with st.expander("🔍 Generated SQL"):
+                        st.code(msg["sql"], language="sql")
+                
+                # Show data if available
+                if msg.get("data") is not None:
+                    df = msg["data"]
+                    st.dataframe(df, use_container_width=True)
+                    
+                    # Show chart if time-series
+                    if 'DATE' in df.columns and len(df) > 1:
+                        numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+                        chart_y = 'CLOSE' if 'CLOSE' in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+                        
+                        if chart_y:
+                            try:
+                                fig = px.line(df, x='DATE', y=chart_y)
+                                fig.update_layout(
+                                    paper_bgcolor=T['plotly_paper'],
+                                    plot_bgcolor=T['plotly_plot'],
+                                    font=dict(color=T['plotly_text']),
+                                    height=300
+                                )
+                                st.plotly_chart(fig, use_container_width=True)
+                            except:
+                                pass
+                    
+                    # Download button
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download",
+                        csv,
+                        "data.csv",
+                        "text/csv",
+                        key=f"dl_hist_{msg.get('id', id(msg))}"
+                    )
 
         if user_question := st.chat_input(f"Ask about {dashboard_ticker}..."):
             st.session_state[chat_key].append({"role": "user", "content": user_question})
@@ -2426,9 +2464,142 @@ Format with markdown bold for section headers."""
                 st.markdown(user_question)
 
             with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
+                with st.spinner("Analyzing..."):
+                    # Build comprehensive context
                     chat_context = build_single_stock_chat_context(dashboard_ticker, latest, route_info)
-                    chat_prompt = f"""You are an expert financial analyst assistant specialized in stock analysis.
+                    
+                    # Check if user wants data/chart
+                    needs_data = any(word in user_question.lower() for word in [
+                        'show', 'data', 'chart', 'graph', 'trend', 'performance', 
+                        'history', 'compare', 'analysis', 'calculate', 'return'
+                    ])
+                    
+                    if needs_data:
+                        # Generate SQL query to fetch data
+                        sql_prompt = f"""You are a SQL expert for stock analysis.
+Database: FINANCE_AI_DB.STOCK_DATA.PRICES
+Columns: date, ticker, open, high, low, close, volume
+Current stock: {dashboard_ticker}
+
+User question: {user_question}
+
+Generate a Snowflake SQL query to answer this question.
+- For price history: SELECT date, close FROM ... WHERE ticker = '{dashboard_ticker}' ORDER BY date LIMIT 365
+- For performance: calculate percentage changes using LAG() or MIN/MAX
+- Always include date column for time-series
+- LIMIT to 500 rows maximum
+
+Return ONLY the SQL query, no markdown, no explanations."""
+
+                        sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                        sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                        
+                        if ';' in sql_query:
+                            sql_query = sql_query.split(';')[0].strip()
+                        
+                        # Execute query
+                        try:
+                            result_df = run_query(sql_query)
+                            
+                            if not result_df.empty:
+                                # Show SQL in expander
+                                with st.expander("🔍 Generated SQL"):
+                                    st.code(sql_query, language="sql")
+                                
+                                # Display data
+                                st.dataframe(result_df, use_container_width=True)
+                                
+                                # Auto-generate chart if time-series data
+                                if 'DATE' in result_df.columns and len(result_df) > 1:
+                                    numeric_cols = result_df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+                                    chart_y = 'CLOSE' if 'CLOSE' in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+                                    
+                                    if chart_y:
+                                        try:
+                                            fig = px.line(
+                                                result_df,
+                                                x='DATE',
+                                                y=chart_y,
+                                                title=f"{dashboard_ticker} - {chart_y.title()} Over Time"
+                                            )
+                                            fig.update_layout(
+                                                paper_bgcolor=T['plotly_paper'],
+                                                plot_bgcolor=T['plotly_plot'],
+                                                font=dict(color=T['plotly_text']),
+                                                xaxis=dict(gridcolor=T['plotly_grid']),
+                                                yaxis=dict(gridcolor=T['plotly_grid']),
+                                                height=400
+                                            )
+                                            st.plotly_chart(fig, use_container_width=True)
+                                        except:
+                                            pass
+                                
+                                # Generate AI analysis based on data
+                                data_summary = result_df.head(20).to_string()
+                                analysis_prompt = f"""You are a senior financial analyst at JPMorgan.
+
+Stock: {dashboard_ticker}
+Current Price: ${latest['CLOSE']:.2f}
+
+User asked: {user_question}
+
+Data retrieved:
+{data_summary}
+
+Provide a professional 3-4 sentence analysis that:
+1. Directly answers the question
+2. References specific numbers from the data
+3. Provides investment context
+4. Gives actionable insights
+
+Be specific with numbers. Use professional Wall Street analyst tone."""
+
+                                analysis, model = call_llm(analysis_prompt, "analysis")
+                                badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                                
+                                # Sentiment analysis
+                                ins_lower = analysis.lower()
+                                bull_words = ["up", "gains", "positive", "outperforming", "bullish", "higher", "surge"]
+                                bear_words = ["down", "decline", "negative", "underperforming", "bearish", "lower", "drop"]
+                                bull_count = sum(1 for w in bull_words if w in ins_lower)
+                                bear_count = sum(1 for w in bear_words if w in ins_lower)
+                                
+                                if bull_count > bear_count:
+                                    sentiment_html = '<span style="background-color:rgba(46,125,50,0.2);color:#81c784;border:1px solid #2e7d32;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🟢 BULLISH</span>'
+                                elif bear_count > bull_count:
+                                    sentiment_html = '<span style="background-color:rgba(198,40,40,0.2);color:#e57373;border:1px solid #c62828;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🔴 BEARISH</span>'
+                                else:
+                                    sentiment_html = '<span style="background-color:rgba(249,168,37,0.2);color:#fff59d;border:1px solid #f9a825;padding:2px 8px;border-radius:12px;font-size:0.8em;margin-left:5px;">🟡 NEUTRAL</span>'
+                                
+                                st.markdown(f"""
+                                {sentiment_html}
+                                <div class="insight-box">
+                                    <div class="insight-label">⬡ AI Analysis — {badge} Intelligence</div>
+                                    {analysis}
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Download button
+                                csv = result_df.to_csv(index=False)
+                                st.download_button(
+                                    "📥 Download Data",
+                                    csv,
+                                    f"{dashboard_ticker}_data.csv",
+                                    "text/csv",
+                                    key=f"dl_single_{len(st.session_state[chat_key])}"
+                                )
+                                
+                                # Save to chat history
+                                st.session_state[chat_key].append({
+                                    "role": "assistant",
+                                    "content": f"{sentiment_html}<br>{analysis}",
+                                    "sql": sql_query,
+                                    "data": result_df
+                                })
+                                
+                        except Exception as e:
+                            # Fallback to simple chat if SQL fails
+                            chat_prompt = f"""You are an expert financial analyst assistant specialized in stock analysis.
 
 {chat_context}
 
@@ -2442,16 +2613,42 @@ Provide a comprehensive answer (3-4 sentences) that:
 
 Be professional, accurate, and helpful. If you need data not provided, acknowledge it and give the best general guidance."""
 
-                    response, model = call_llm(chat_prompt, "chat")
-                    badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                            response, model = call_llm(chat_prompt, "chat")
+                            badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
 
-                    st.markdown(f"**{badge}**")
-                    st.markdown(response)
+                            st.markdown(f"**{badge}**")
+                            st.markdown(response)
 
-                    st.session_state[chat_key].append({
-                        "role": "assistant",
-                        "content": f"**{badge}**\n\n{response}"
-                    })
+                            st.session_state[chat_key].append({
+                                "role": "assistant",
+                                "content": f"**{badge}**\n\n{response}"
+                            })
+                    else:
+                        # Simple conversational response (no data needed)
+                        chat_prompt = f"""You are an expert financial analyst assistant specialized in stock analysis.
+
+{chat_context}
+
+User Question: {user_question}
+
+Provide a comprehensive answer (3-4 sentences) that:
+1. Directly answers the question with specifics
+2. References actual data points and numbers from the context
+3. Provides context (historical perspective, sector trends, comparisons)
+4. Gives actionable insights or recommendations when relevant
+
+Be professional, accurate, and helpful."""
+
+                        response, model = call_llm(chat_prompt, "chat")
+                        badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+
+                        st.markdown(f"**{badge}**")
+                        st.markdown(response)
+
+                        st.session_state[chat_key].append({
+                            "role": "assistant",
+                            "content": f"**{badge}**\n\n{response}"
+                        })
 
     st.stop()
 
