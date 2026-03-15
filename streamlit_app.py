@@ -491,6 +491,37 @@ def get_connection():
         return None
 
 # ─── SMART DATA FETCHER ───────────────────────────────────────────────────────
+def standardize_date_column(df, date_col='DATE'):
+    """
+    Standardize date column by:
+    1. Converting to datetime
+    2. Removing timezone info
+    3. Sorting by date
+    
+    Args:
+        df: DataFrame with date column
+        date_col: Name of date column (default 'DATE')
+    
+    Returns:
+        DataFrame with standardized dates
+    """
+    if df.empty:
+        return df
+    
+    df = df.copy()
+    
+    # Convert to datetime
+    df[date_col] = pd.to_datetime(df[date_col])
+    
+    # Remove timezone if present
+    if df[date_col].dt.tz is not None:
+        df[date_col] = df[date_col].dt.tz_localize(None)
+    
+    # Sort by date
+    df = df.sort_values(date_col)
+    
+    return df
+
 def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
     """
     Smart data fetcher: tries DB first, falls back to Yahoo Finance API, then FMP API.
@@ -519,7 +550,7 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
         if db_data is not None and not db_data.empty:
             # Database has data! Use it
             db_data.columns = ['DATE', 'TICKER', 'CLOSE']
-            db_data['DATE'] = pd.to_datetime(db_data['DATE'])
+            db_data = standardize_date_column(db_data)
             return db_data, "database"
             
     except Exception as e:
@@ -544,9 +575,7 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
                 'TICKER': ticker,
                 'CLOSE': yf_data['Close'].values
             })
-            result['DATE'] = pd.to_datetime(result['DATE'])
-            result = result.reset_index(drop=True)
-            
+            result = standardize_date_column(result)
             return result, "yahoo_api"
             
     except Exception as e:
@@ -575,9 +604,8 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
                 fmp_df = pd.DataFrame(data['historical'])
                 fmp_df = fmp_df.rename(columns={'date': 'DATE', 'close': 'CLOSE'})
                 fmp_df['TICKER'] = ticker
-                fmp_df['DATE'] = pd.to_datetime(fmp_df['DATE'])
-                fmp_df = fmp_df[['DATE', 'TICKER', 'CLOSE']].sort_values('DATE')
-                
+                fmp_df = fmp_df[['DATE', 'TICKER', 'CLOSE']]
+                fmp_df = standardize_date_column(fmp_df)
                 return fmp_df, "fmp_api"
                 
     except Exception as e:
@@ -1117,6 +1145,10 @@ def show_stock_chart(ticker, days, theme, route_info):
                 db_df = pd.DataFrame()
 
         # ── 4. Combine all sources (Yahoo preferred for recency) ──
+        db_df = standardize_date_column(db_df)
+        api_df = standardize_date_column(api_df)
+        yahoo_df = standardize_date_column(yahoo_df)
+        
         frames = [df for df in [db_df, api_df, yahoo_df] if not df.empty]
         if not frames:
             st.warning(f"No data available for {ticker}")
