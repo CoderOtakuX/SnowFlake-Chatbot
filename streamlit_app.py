@@ -1440,7 +1440,7 @@ with st.sidebar:
     st.caption(f"⚡ Groq AI: {st.session_state.groq_calls_today}/1800 calls")
     
     st.divider()
-    st.caption("📊 DB: 29.7M records (1962-2023)")
+    st.caption("📊 DB: 29.7M records (1973-Present)")
     st.caption("🔴 Live: FMP API (real-time)")
     st.caption("⚡ Fast AI: Groq (0.3s)")
     st.caption("🛡️ Reliable AI: Mistral (2-3s)")
@@ -2344,7 +2344,7 @@ Be professional but conversational. If data is missing, acknowledge it and provi
 
         # ── Timeline Selector ────────────────────────────────────────────
         st.markdown("**📅 Select Time Period**")
-        timeline_cols = st.columns(5)
+        timeline_cols = st.columns(6)
         with timeline_cols[0]:
             btn_1w = st.button("1 Week", use_container_width=True, key="single_1w")
         with timeline_cols[1]:
@@ -2352,38 +2352,52 @@ Be professional but conversational. If data is missing, acknowledge it and provi
         with timeline_cols[2]:
             btn_6m = st.button("6 Months", use_container_width=True, key="single_6m")
         with timeline_cols[3]:
-            btn_1y = st.button("1 Year", use_container_width=True, type="primary", key="single_1y")
+            btn_1y = st.button("1 Year", use_container_width=True, type="primary" if st.session_state.get('single_period') == 365 else "secondary", key="single_1y")
         with timeline_cols[4]:
             btn_all = st.button("All Time", use_container_width=True, key="single_all")
+        with timeline_cols[5]:
+            btn_custom = st.button("Custom", use_container_width=True, type="primary" if st.session_state.get('single_period') == "custom" else "secondary", key="single_custom")
 
         if 'single_period' not in st.session_state:
             st.session_state.single_period = 365
-        if btn_1w:
-            st.session_state.single_period = 7
-        elif btn_1m:
-            st.session_state.single_period = 30
-        elif btn_6m:
-            st.session_state.single_period = 180
-        elif btn_1y:
-            st.session_state.single_period = 365
-        elif btn_all:
-            st.session_state.single_period = None
+        
+        if btn_1w: st.session_state.single_period = 7
+        elif btn_1m: st.session_state.single_period = 30
+        elif btn_6m: st.session_state.single_period = 180
+        elif btn_1y: st.session_state.single_period = 365
+        elif btn_all: st.session_state.single_period = None
+        elif btn_custom: st.session_state.single_period = "custom"
 
-        period_labels = {7: "1 Week", 30: "1 Month", 180: "6 Months", 365: "1 Year", None: "All Time"}
+        period_labels = {7: "1 Week", 30: "1 Month", 180: "6 Months", 365: "1 Year", None: "All Time", "custom": "Custom Range"}
         current_label = period_labels.get(st.session_state.single_period, "1 Year")
+        
+        if st.session_state.single_period == "custom":
+            date_col1, date_col2 = st.columns(2)
+            with date_col1:
+                start_date = st.date_input("Start Date", 
+                                           value=pd.Timestamp.now().date() - pd.Timedelta(days=365),
+                                           max_value=pd.Timestamp.now().date(),
+                                           key="single_start_date")
+            with date_col2:
+                end_date = st.date_input("End Date", 
+                                         value=pd.Timestamp.now().date(),
+                                         max_value=pd.Timestamp.now().date(),
+                                         key="single_end_date")
+            if start_date > end_date:
+                st.error("Start Date must be before End Date")
+                st.stop()
+        else:
+            if st.session_state.get('single_period'):
+                end_date = pd.Timestamp.now().date()
+                start_date = end_date - pd.Timedelta(days=st.session_state.single_period)
+            else:
+                start_date = pd.Timestamp('1980-01-01').date()
+                end_date = pd.Timestamp.now().date()
 
         st.divider()
 
         # ── Candlestick Chart ────────────────────────────────────────────
         st.markdown(f"**📈 Price Chart — {current_label}**")
-        
-        # Determine date range for single stock
-        if st.session_state.get('single_period'):
-            end_date = pd.Timestamp.now().date()
-            start_date = end_date - pd.Timedelta(days=st.session_state.single_period)
-        else:
-            start_date = pd.Timestamp('1980-01-01').date()
-            end_date = pd.Timestamp.now().date()
 
         # Use smart fetcher for single stock too
         single_data, single_source = fetch_comparison_data_smart(
@@ -2833,7 +2847,7 @@ try:
 except:
     total_rec = "29,677,722"
     total_stocks = "7,693"
-    date_range = "1962–2023"
+    date_range = "1973–Present"
 
 st.markdown(f"""
 <div class="metrics-row">
@@ -2899,11 +2913,11 @@ with ctrl_col1:
 
 with ctrl_col2:
     date_from = st.date_input("From Date", value=date(2020, 1, 1),
-                              min_value=date(1962, 1, 1), max_value=date(2023, 12, 31))
+                              min_value=date(1973, 1, 1), max_value=date.today())
 
 with ctrl_col3:
-    date_to = st.date_input("To Date", value=date(2023, 12, 31),
-                            min_value=date(1962, 1, 1), max_value=date(2023, 12, 31))
+    date_to = st.date_input("To Date", value=pd.Timestamp.now().date(),
+                            min_value=date(1973, 1, 1), max_value=date.today())
 
 # ─── CHARTS SECTION ──────────────────────────────────────────────────────────
 if selected_tickers:
@@ -3232,7 +3246,7 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                     route_results = smart_data_router(tickers, fmp_api_key)
                     
                     if not snowflake_available:
-                        st.warning("⚠️ Database temporarily unavailable (account security lockout). \n\nUsing live API data only. Historical data from 1962-2023 unavailable until Snowflake account is unlocked. Please wait 30-60 minutes or reset your password.")
+                        st.warning("⚠️ Database temporarily unavailable (account security lockout). \n\nUsing live API data only. Historical data from 1973-Present unavailable until Snowflake account is unlocked. Please wait 30-60 minutes or reset your password.")
                     
                     badges_html = ""
                     has_api_data = False
@@ -3294,7 +3308,7 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
 Database: FINANCE_AI_DB.STOCK_DATA.PRICES
 Columns: date (DATE), ticker (VARCHAR), open (FLOAT), high (FLOAT), low (FLOAT), close (FLOAT), volume (FLOAT), adj_close (FLOAT)
 Available tickers in DB: {', '.join(db_tickers)}
-IMPORTANT: The database contains HISTORICAL data only (roughly 1962 to late 2023). For recent/current prices, the app uses a separate live API — do NOT try to query for dates after 2023.
+IMPORTANT: The database contains HISTORICAL data from 1973 to Present. For recent/current prices that the database may lag behind on, the app uses a separate Live API constraint.
 User question: {prompt}
 CRITICAL RULES:
 1. Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE().
