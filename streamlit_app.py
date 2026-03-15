@@ -523,12 +523,10 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
             return db_data, "database"
             
     except Exception as e:
-        st.caption(f"⚠️ Database query failed for {ticker}: {e}")
+        pass
     
     # Step 2: Database empty or failed - try Yahoo Finance API
     try:
-        st.caption(f"🔄 Fetching {ticker} from Yahoo Finance API...")
-        
         # Use Ticker object (works in all yfinance versions)
         stock = yf.Ticker(ticker)
         
@@ -549,18 +547,13 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
             result['DATE'] = pd.to_datetime(result['DATE'])
             result = result.reset_index(drop=True)
             
-            st.success(f"✅ {ticker}: Loaded {len(result)} days from Yahoo Finance")
             return result, "yahoo_api"
-        else:
-            st.warning(f"⚠️ {ticker}: No data from Yahoo Finance for this period")
             
     except Exception as e:
-        st.caption(f"⚠️ Yahoo Finance failed for {ticker}: {str(e)}")
+        pass
     
     # Step 3: Both failed - try FMP API as last resort
     try:
-        st.caption(f"🔄 Trying FMP API for {ticker}...")
-        
         # Calculate period in days
         days_diff = (end_dt - start_dt).days
         
@@ -588,7 +581,7 @@ def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
                 return fmp_df, "fmp_api"
                 
     except Exception as e:
-        st.caption(f"⚠️ FMP API also failed for {ticker}")
+        pass
     
     # All sources failed
     return pd.DataFrame(), "not_found"
@@ -1203,7 +1196,7 @@ def smart_ticker_lookup(search_input):
     # Company name → ticker mapping
     ticker_map = {
         # Tech
-        'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL',
+        'apple': 'AAPL', 'microsoft': 'MSFT', 'google': 'GOOGL', 'googl': 'GOOGL', 'goog': 'GOOG',
         'alphabet': 'GOOGL', 'amazon': 'AMZN', 'meta': 'META',
         'facebook': 'META', 'nvidia': 'NVDA', 'tesla': 'TSLA',
         'netflix': 'NFLX', 'amd': 'AMD', 'intel': 'INTC',
