@@ -1160,7 +1160,7 @@ def show_stock_chart(ticker, days, theme, route_info):
         data = data.sort_values('DATE').reset_index(drop=True)
 
         # ── 5. Filter: take the last N trading days of available data ──
-        if days is not None:
+        if days is not None and days != "custom":
             data = data.tail(days)
 
         if data.empty:
@@ -2836,18 +2836,17 @@ Be professional, accurate, and helpful."""
 # ─── DATASET METRICS ─────────────────────────────────────────────────────────
 try:
     stats = run_query("""
-        SELECT COUNT(*) as TOTAL_RECORDS, COUNT(DISTINCT ticker) as TOTAL_STOCKS,
-               MIN(date) as EARLIEST_DATE, MAX(date) as LATEST_DATE
+        SELECT COUNT(*) as TOTAL_RECORDS, COUNT(DISTINCT ticker) as TOTAL_STOCKS
         FROM FINANCE_AI_DB.STOCK_DATA.PRICES
     """)
     row = stats.iloc[0]
     total_rec = f"{int(row['TOTAL_RECORDS']):,}"
     total_stocks = f"{int(row['TOTAL_STOCKS']):,}"
-    date_range = f"{pd.to_datetime(row['EARLIEST_DATE']).year}–{pd.to_datetime(row['LATEST_DATE']).year}"
 except:
     total_rec = "29,677,722"
     total_stocks = "7,693"
-    date_range = "1973–Present"
+
+date_range = "1973–Present"
 
 st.markdown(f"""
 <div class="metrics-row">
@@ -2864,7 +2863,7 @@ st.markdown(f"""
     <div class="metric-cell">
         <div class="metric-label">Coverage</div>
         <div class="metric-value" style="font-size:1.3rem;">{date_range}</div>
-        <div class="metric-sub">62 years of market data</div>
+        <div class="metric-sub">50+ years of market data</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
