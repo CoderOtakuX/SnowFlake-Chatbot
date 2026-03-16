@@ -14,6 +14,41 @@ try:
 except ImportError:
     yfinance_available = False
 
+# Fallback S&P 500 major stocks list if analyzing top mainstream stocks
+MAJOR_STOCKS = [
+    'AAPL', 'MSFT', 'AMZN', 'NVDA', 'GOOGL', 'META', 'TSLA', 'BRK.B', 'UNH', 'JNJ',
+    'JPM', 'V', 'PG', 'MA', 'HD', 'CVX', 'ABBV', 'LLY', 'MRK', 'PEP',
+    'COST', 'KO', 'AVGO', 'WMT', 'TMO', 'MCD', 'CSCO', 'ABT', 'CRM', 'DHR',
+    'ACN', 'PFE', 'LIN', 'BAC', 'NKE', 'ADBE', 'TXN', 'NFLX', 'CMCSA', 'PM',
+    'VZ', 'DIS', 'ORCL', 'ABNB', 'UPS', 'HON', 'WFC', 'NEE', 'INTC', 'T',
+    'AMD', 'QCOM', 'BMY', 'SPY', 'QQQ', 'OXY', 'XOM', 'MPC', 'HES', 'COP'
+]
+
+# Market cap tiers (industry standard)
+MEGA_CAP = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B']
+
+LARGE_CAP = MEGA_CAP + [
+    'JPM', 'V', 'JNJ', 'WMT', 'PG', 'MA', 'HD', 'CVX', 'XOM', 'LLY',
+    'ABBV', 'MRK', 'KO', 'PEP', 'COST', 'AVGO', 'TMO', 'ABT', 'ORCL', 'CRM',
+    'ADBE', 'NFLX', 'CSCO', 'AMD', 'QCOM', 'TXN', 'INTC', 'UNH', 'BAC', 'WFC'
+]
+
+FULL_COVERAGE = LARGE_CAP + [
+    # Energy (Critical for sector rotations)
+    'COP', 'SLB', 'EOG', 'MPC', 'PSX', 'VLO', 'OXY', 'HES', 'DVN', 'HAL',
+    'PXD', 'MRO', 'APA', 'FANG', 'OVV', 'CTRA', 'BKR', 'NOV',
+    # Finance
+    'GS', 'MS', 'C', 'BLK', 'SPGI', 'AXP', 'USB', 'PNC', 'SCHW',
+    # Healthcare
+    'PFE', 'BMY', 'AMGN', 'GILD', 'REGN', 'ISRG', 'CI', 'CVS', 'ELV',
+    # Tech
+    'IBM', 'AMAT', 'LRCX', 'KLAC', 'MRVL', 'SNOW', 'PLTR', 'DDOG',
+    # Consumer
+    'NKE', 'SBUX', 'MCD', 'TGT', 'LOW', 'TJX', 'DIS', 'CMCSA',
+    # Industrial
+    'BA', 'CAT', 'GE', 'HON', 'UNP', 'DE', 'LMT', 'RTX', 'NOC'
+]
+
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="FinSight AI",
@@ -21,6 +56,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+
+# ═══════════════════════════════════════════════════════════════
 
 # ─── THEME TOGGLE STATE ──────────────────────────────────────────────────────
 if "dark_mode" not in st.session_state:
@@ -521,6 +559,26 @@ def standardize_date_column(df, date_col='DATE'):
     df = df.sort_values(date_col)
     
     return df
+
+def parse_year_range(prompt):
+    """
+    FIX #3: Multi-Year Range Parser
+    Detects patterns like '2020 to 2022' or '2020-2022' instead of just finding a single year.
+    Returns (start_year, end_year) if found, else (None, None).
+    """
+    import re
+    # Match patterns like "2020 to 2022", "2020-2022", "2020 - 2022"
+    range_match = re.search(r'\b(20\d{2})\s*(?:to|-)\s*(20\d{2})\b', prompt.lower())
+    if range_match:
+        return int(range_match.group(1)), int(range_match.group(2))
+    
+    # Match single year
+    single_match = re.search(r'\b(20\d{2})\b', prompt)
+    if single_match:
+        yr = int(single_match.group(1))
+        return yr, yr
+        
+    return None, None
 
 def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
     """
@@ -2134,7 +2192,8 @@ if current_page == "📊 Dashboard":
                         key=f"dl_hist_{msg.get('id', id(msg))}"
                     )
 
-        if user_question := st.chat_input(f"Compare {', '.join(compare_tickers)}..."):
+        user_question = st.text_input(f"Compare {', '.join(compare_tickers)}...", key=f"compare_input_{comp_chat_key}")
+        if user_question:
             st.session_state[comp_chat_key].append({"role": "user", "content": user_question})
             with st.chat_message("user"):
                 st.markdown(user_question)
@@ -2148,6 +2207,16 @@ if current_page == "📊 Dashboard":
                     ])
                     
                     if needs_data and len(compare_tickers) > 0:
+                        # Extract requested year range for the comparison (FIX #3)
+                        start_year, end_year = parse_year_range(user_question)
+                        
+                        date_instruction = "- For time-series: ORDER BY date, LIMIT 365"
+                        if start_year and end_year:
+                            if start_year == end_year:
+                                date_instruction = f"- STRICTLY filter dates to only include {start_year}: AND YEAR(date) = {start_year}"
+                            else:
+                                date_instruction = f"- STRICTLY filter dates to between {start_year} and {end_year}: AND YEAR(date) BETWEEN {start_year} AND {end_year}"
+
                         # Generate comparison SQL
                         tickers_str = ", ".join([f"'{t}'" for t in compare_tickers])
                         sql_prompt = f"""Generate SQL to compare these stocks: {', '.join(compare_tickers)}
@@ -2160,7 +2229,7 @@ User question: {user_question}
 Generate Snowflake SQL that:
 - Includes data for all tickers: WHERE ticker IN ({tickers_str})
 - Shows comparison metrics (price, returns, volume)
-- For time-series: ORDER BY date, LIMIT 365
+{date_instruction}
 - For aggregates: GROUP BY ticker
 
 Return ONLY SQL, no markdown."""
@@ -2637,7 +2706,8 @@ Format with markdown bold for section headers."""
                         key=f"dl_hist_{msg.get('id', id(msg))}"
                     )
 
-        if user_question := st.chat_input(f"Ask about {dashboard_ticker}..."):
+        user_question = st.text_input(f"Ask about {dashboard_ticker}...", key=f"dash_input_{chat_key}")
+        if user_question:
             st.session_state[chat_key].append({"role": "user", "content": user_question})
             with st.chat_message("user"):
                 st.markdown(user_question)
@@ -3234,6 +3304,31 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                 ai_badge_class = "badge-groq" if extraction_model == "groq" else "badge-mistral"
                 ai_badge_text = "⚡ GROQ" if extraction_model == "groq" else "🛡️ MISTRAL"
                 
+                # Smart defaults based on keywords
+                prompt_lower = prompt.lower()
+                
+                # Determine sort preference from query keywords
+                if 'dividend' in prompt_lower:
+                    sort_by = 'percentage_change'  # fallback since dividend_yield not implemented fully
+                    sort_label = 'Returns'
+                    sort_order = 'DESC'
+                    st.info("💡 Tip: Searching by highest returns. Dividend sorting coming soon!")
+                elif 'volume' in prompt_lower or 'traded' in prompt_lower:
+                    sort_by = 'avg_volume'
+                    sort_label = 'Trading Volume'
+                    sort_order = 'DESC'
+                    st.info("💡 Searching by trading volume")
+                elif 'stable' in prompt_lower or 'volatility' in prompt_lower:
+                    sort_by = 'volatility'
+                    sort_label = 'Stability (Low Volatility)'
+                    sort_order = 'ASC'
+                    st.info("💡 Searching by stability (lowest volatility)")
+                else:
+                    # Default: highest returns
+                    sort_by = 'percentage_change'
+                    sort_label = 'Returns'
+                    sort_order = 'DESC'
+                
                 # Step 2: Rate limit check
                 if len(tickers) > 10:
                     msg = "⚠️ Please limit comparisons to **10 stocks maximum** to optimize performance."
@@ -3277,14 +3372,7 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                     for msg in not_found_msgs:
                         st.markdown(msg)
                     
-                    # Debug info
-                    with st.expander("🔧 Debug: Data Routing Details"):
-                        st.caption(f"Snowflake DB: {'🟢 Connected' if snowflake_available else '🔴 Offline (account locked?)'}")
-                        st.caption(f"FMP API Key: {'🟢 Configured' if fmp_api_key else '🔴 Missing'}")
-                        st.caption(f"Groq AI: {'🟢 Active' if groq_available else '🟡 Offline'}")
-                        for t, info in route_results.items():
-                            st.caption(f"{t}: source={info['source']}, error={info.get('error', 'None')}")
-                    
+
                     valid_tickers = [t for t, i in route_results.items() if i["source"] != "not_found"]
                     
                     if valid_tickers:
@@ -3336,10 +3424,70 @@ Generate the SQL now:"""
                                     clean_lines.append(line)
                             if clean_lines:
                                 sql_query = '\n'.join(clean_lines)
+
+                            # Detect percentage change queries and add safeguards
+                            if any(word in prompt.lower() for word in ['top', 'best', 'highest', 'performance', 'gain', 'return']):
+                                # Add realistic bounds to percentage calculations
+                                if 'percentage' in sql_query.lower() or 'change' in sql_query.lower():
+                                    # Inject HAVING clause to filter unrealistic values
+                                    if 'HAVING' not in sql_query.upper():
+                                        if 'ORDER BY' in sql_query.upper():
+                                            parts = sql_query.split('ORDER BY')
+                                            sql_query = parts[0] + ' HAVING percentage_change BETWEEN -99 AND 500 ORDER BY' + parts[1]
+                                        elif 'LIMIT' in sql_query.upper():
+                                            parts = sql_query.split('LIMIT')
+                                            sql_query = parts[0] + ' HAVING percentage_change BETWEEN -99 AND 500 LIMIT' + parts[1]
+
+                            # Also add data quality check - filter out penny stocks
+                            if 'WHERE' in sql_query.upper() and 'close' in sql_query.lower():
+                                # Find WHERE clause and add price floor
+                                where_idx = sql_query.upper().find('WHERE')
+                                group_idx = sql_query.upper().find('GROUP BY')
+                                
+                                if group_idx > where_idx:
+                                    before_group = sql_query[:group_idx]
+                                    after_group = sql_query[group_idx:]
+                                    sql_query = before_group + ' AND close > 1.0 ' + after_group
+                                else:
+                                    # Find ORDER BY or LIMIT
+                                    order_idx = sql_query.upper().find('ORDER BY')
+                                    if order_idx > where_idx:
+                                        before_order = sql_query[:order_idx]
+                                        after_order = sql_query[order_idx:]
+                                        sql_query = before_order + ' AND close > 1.0 ' + after_order
                             with st.expander("🔍 Generated SQL"):
                                 st.code(sql_query, language="sql")
                             try:
                                 result_df = run_query(sql_query)
+
+                                if not result_df.empty:
+                                    # Check for unrealistic percentage values
+                                    pct_cols = [col for col in result_df.columns if 'percentage' in col.lower() or 'change' in col.lower() or 'return' in col.lower()]
+                                    
+                                    for col in pct_cols:
+                                        if result_df[col].dtype in ['float64', 'int64']:
+                                            # Flag if any value exceeds realistic bounds
+                                            max_val = result_df[col].max()
+                                            min_val = result_df[col].min()
+                                            
+                                            if max_val > 1000 or min_val < -100:
+                                                # Data quality issue detected
+                                                st.warning(f"""
+                                                ⚠️ **Data Quality Alert**
+                                                
+                                                Detected unusual percentage values (max: {max_val:.1f}%, min: {min_val:.1f}%).
+                                                
+                                                This may indicate:
+                                                - Stock splits/reverse splits in the data
+                                                - Penny stock volatility
+                                                - Data quality issues
+                                                
+                                                Filtering to realistic ranges (-99% to +500%)...
+                                                """)
+                                                
+                                                # Filter to realistic values
+                                                mask = (result_df[col] >= -99) & (result_df[col] <= 500)
+                                                result_df = result_df[mask].reset_index(drop=True)
                             except Exception as sql_err:
                                 pass  # Silent: API data fallback will handle this
                         
@@ -3354,14 +3502,27 @@ Generate the SQL now:"""
                             if result_df.empty:
                                 result_df = api_combined
                             else:
-                                # ALWAYS merge API data with DB data for combined sources
-                                # This ensures queries like "top 5 all time" include 2024-2025 data
+                                # Check if Snowflake DB data already adequately answers the query
+                                # Merge data sources: fill gaps, do not indiscriminately append
                                 common_cols = list(set(result_df.columns) & set(api_combined.columns))
                                 if common_cols:
-                                    result_df = pd.concat([result_df, api_combined[common_cols]], ignore_index=True)
-                                    if 'DATE' in result_df.columns and 'TICKER' in result_df.columns:
-                                        result_df = result_df.drop_duplicates(subset=['DATE', 'TICKER'], keep='last')
-                                    result_df = result_df.sort_values('DATE', ascending=False).reset_index(drop=True) if 'DATE' in result_df.columns else result_df
+                                    # Identify the latest date in the Snowflake dataset
+                                    if 'DATE' in result_df.columns:
+                                        max_db_date = result_df['DATE'].max()
+                                        
+                                        # Only append API data that is NEWER than the Snowflake data
+                                        # This prevents appending 2024 API data when the user explicitly queried 2022
+                                        if pd.notna(max_db_date):
+                                            # We check if the user seems to want current data (by if recent data was requested/implied)
+                                            # We will just append the API data that falls chronologically *after* our Snowflake data
+                                            new_api_data = api_combined[api_combined['DATE'] > max_db_date]
+                                            
+                                            if not new_api_data.empty:
+                                                result_df = pd.concat([result_df, new_api_data[common_cols]], ignore_index=True)
+                                                result_df = result_df.drop_duplicates(subset=['DATE', 'TICKER'], keep='last')
+                                                result_df = result_df.sort_values('DATE', ascending=False).reset_index(drop=True)
+                                    else:
+                                        result_df = pd.concat([result_df, api_combined[common_cols]], ignore_index=True)
                         
                         if len(result_df) > 0:
                             # Handle quarterly aggregation explicitly
@@ -3481,64 +3642,479 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
                         st.warning("⚠️ Screener requires database access. Database is currently locked.")
                         st.stop()
                         
-                    sql_prompt = f"""You are a SQL expert screening stock market data.
-Database: FINANCE_AI_DB.STOCK_DATA.PRICES
-Columns: date, ticker, open, high, low, close, volume
-User question: {prompt}
-Write a Snowflake SQL query to answer this screening request. 
-Examples: "stocks that doubled in 2021", "top 5 volume".
-Calculate percentage changes using MIN/MAX by date if needed.
-Return ONLY raw SQL. Limit results to 20 rows."""
+                    # ─── SMART DEFAULT BEHAVIOR (NO CLARIFICATION UI) ────────────────────────
+                    # Instead of asking users, we make smart assumptions based on keywords
                     
-                    sql_query, _ = call_llm(sql_prompt, "sql_generation")
-                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-                    with st.expander("🔍 Generated Screener SQL"):
-                        st.code(sql_query, language="sql")
+                    prompt_lower = prompt.lower()
+                    
+                    # Detect if user wants WORST/LOWEST performers
+                    if any(word in prompt_lower for word in ['worst', 'worst-performing', 'losers', 'bottom', 'lowest']):
+                        # User wants biggest losers
+                        order_by = "ORDER BY percentage_change ASC"  # Ascending = worst first
+                        sort_label = "Worst Performers"
+                        st.info("📉 Showing worst performers (biggest losses)")
                         
+                    elif 'dividend' in prompt_lower:
+                        # User wants dividend stocks
+                        st.info("💡 Showing stocks with best dividends. For returns-based ranking, use 'highest returns' in your query.")
+                        order_by = "ORDER BY dividend_yield DESC"
+                        sort_label = "Dividends"
+                        
+                    elif 'volume' in prompt_lower or 'traded' in prompt_lower or 'liquid' in prompt_lower:
+                        # User wants most traded stocks
+                        st.info("💡 Showing most traded stocks by volume.")
+                        order_by = "ORDER BY avg_volume DESC"
+                        sort_label = "Volume"
+                        
+                    elif 'stable' in prompt_lower or 'volatility' in prompt_lower or 'safe' in prompt_lower:
+                        # User wants stable stocks
+                        st.info("💡 Showing most stable stocks (lowest volatility).")
+                        order_by = "ORDER BY volatility ASC"
+                        sort_label = "Stability"
+                        
+                    else:
+                        # Default: best performers
+                        order_by = "ORDER BY percentage_change DESC"
+                        sort_label = "Returns"
+                    
+                    # Extract tickers (existing code continues here)
+                    tickers, extraction_model = extract_tickers_from_question(prompt)
+                    
+
+                        
+                    # Update the prompt to use for further processing
+                    prompt = prompt # no original_prompt anymore
+
+                # ═══════════════════════════════════════════════════════════════
+                # FILTER DETECTION
+                # ═══════════════════════════════════════════════════════════════
+
+                # Initialize with safe defaults
+                use_major_filter = True  # Default: filter to major stocks
+                filter_description = "Major stocks only (S&P 500 + top liquid stocks)"
+
+                # Check for small-cap keywords
+                prompt_lower = prompt.lower()
+                small_cap_keywords = ['small cap', 'small-cap', 'micro cap', 'penny', 
+                                      'biotech', 'emerging', 'startup', 'ipo', 'spac']
+
+                if any(keyword in prompt_lower for keyword in small_cap_keywords):
+                    use_major_filter = False
+                    filter_description = "All stocks (including small-cap)"
+                    st.info("🔍 Including small-cap stocks based on your query")
+
+                # Now use_major_filter is ALWAYS defined before SQL generation
+
+                # HARDCODED SMART SCREENER - No LLM SQL generation for percentage queries
+                # This prevents bad calculations from LLM-generated SQL
+                
+                # Detect what kind of screener this is
+                is_percentage_screener = any(word in prompt.lower() for word in [
+                    'top', 'best', 'highest', 'performance', 'performing', 'gain', 'return', 
+                    'winner', 'loser', 'losers', 'doubled', 'tripled', 'grew',
+                    'worst', 'bottom', 'lowest', 'worst-performing'
+                ])
+                
+                # FIX #3: Extract year range if mentioned
+                start_year, end_year = parse_year_range(prompt)
+                
+                # Default to 2022 if no years provided (based on the original code's preference)
+                if not start_year:
+                    start_year = 2022
+                    end_year = 2022
+                
+                # SQL snippet for year filtering
+                if start_year == end_year:
+                    year_filter_sql = f"YEAR(date) = {start_year}"
+                else:
+                    year_filter_sql = f"YEAR(date) BETWEEN {start_year} AND {end_year}"
+                
+                # Extract number of stocks wanted
+                import re
+                num_match = re.search(r'\b(top|best|highest|worst|bottom|lowest)\s+(\d+)\b', prompt.lower())
+                limit = int(num_match.group(2)) if num_match else 5
+                limit = min(limit, 20)  # Cap at 20
+                
+                if is_percentage_screener:
+                    # Detect user intent
+                    # Smart filtering UI (collapsed by default for clean UX)
+                    with st.expander("⚙️ Advanced Filters", expanded=False):
+                        filter_col1, filter_col2, filter_col3 = st.columns(3)
+                        
+                        with filter_col1:
+                            market_cap_filter = st.radio(
+                                "Market Cap Coverage",
+                                options=["All Stocks", "S&P 500 Coverage", "Large-Cap Only", "Mega-Cap Only"],
+                                index=1,  # Default: S&P 500 Coverage (balanced)
+                                help="""
+                                • All Stocks: Complete market (like Google) - may include small-caps
+                                • S&P 500 Coverage: ~200 major stocks across all sectors
+                                • Large-Cap Only: Top 50 established companies
+                                • Mega-Cap Only: Top 8 tech giants (FAANG+)
+                                """
+                            )
+                        
+                        with filter_col2:
+                            min_price = st.slider(
+                                "Min Stock Price",
+                                min_value=0.0,
+                                max_value=10.0,
+                                value=1.0,
+                                step=0.5,
+                                help="Filter out penny stocks below this price"
+                            )
+                        
+                        with filter_col3:
+                            min_volume = st.select_slider(
+                                "Min Avg Volume",
+                                options=[10000, 100000, 500000, 1000000, 5000000],
+                                value=1000000,
+                                format_func=lambda x: f"{x:,.0f}",
+                                help="Minimum average daily trading volume"
+                            )
+                    
+                    # Apply filter based on selection
+                    if market_cap_filter == "All Stocks":
+                        ticker_filter = "AND ticker NOT IN ('', 'NULL', 'N/A')"
+                        filter_badge = "🌍 ALL STOCKS"
+                        filter_desc = "Complete market coverage (includes small-caps)"
+                        price_threshold = min_price
+                        volume_threshold = min_volume
+                        
+                    elif market_cap_filter == "S&P 500 Coverage":
+                        tickers_str = "', '".join(FULL_COVERAGE)
+                        ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                        filter_badge = "🎯 S&P 500"
+                        filter_desc = f"{len(FULL_COVERAGE)} major stocks across all sectors"
+                        price_threshold = min_price
+                        volume_threshold = min_volume
+                        
+                    elif market_cap_filter == "Large-Cap Only":
+                        tickers_str = "', '".join(LARGE_CAP)
+                        ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                        filter_badge = "🏢 LARGE-CAP"
+                        filter_desc = f"Top {len(LARGE_CAP)} established companies"
+                        price_threshold = min_price
+                        volume_threshold = max(volume_threshold, 1000000)  # Enforce higher volume
+                        
+                    else:  # Mega-Cap Only
+                        tickers_str = "', '".join(MEGA_CAP)
+                        ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                        filter_badge = "⭐ MEGA-CAP"
+                        filter_desc = "Top 8 tech giants (FAANG+)"
+                        price_threshold = min_price
+                        volume_threshold = max(volume_threshold, 5000000)  # Highest volume requirement
+                    
+                    # Professional info display
+                    st.markdown(f"""
+                    <div style="background:{T['bg_card']}; border-left:3px solid {T['gold']}; 
+                                padding:1rem; border-radius:0 6px 6px 0; margin-bottom:1rem;">
+                        <div style="display:flex; align-items:center; gap:10px; margin-bottom:0.5rem;">
+                            <span style="font-size:0.75rem; font-weight:700; letter-spacing:0.1em; 
+                                         color:{T['gold']}; background:{T['bg_card2']}; 
+                                         padding:4px 10px; border-radius:4px;">
+                                {filter_badge}
+                            </span>
+                            <span style="font-size:0.85rem; color:{T['text_secondary']};">
+                                {filter_desc}
+                            </span>
+                        </div>
+                        <div style="font-size:0.75rem; color:{T['text_muted']}; line-height:1.6;">
+                            Filters: Price ≥ ${price_threshold} • Volume ≥ {volume_threshold:,} • 
+                            Returns: -95% to +300% • Min 50 trading days
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # FIX #1: Ensure order_by is always defined before SQL generation
+                    if 'order_by' not in locals() or order_by is None:
+                        order_by = "ORDER BY percentage_change DESC"
+
+                    year_label = str(start_year) if start_year == end_year else f"{start_year}-{end_year}"
+
+                    sql_query = f"""
+                    WITH yearly_prices AS (
+                        SELECT 
+                            ticker,
+                            date,
+                            close,
+                            volume,
+                            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date ASC) as first_row,
+                            ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) as last_row,
+                            COUNT(*) OVER (PARTITION BY ticker) as trading_days,
+                            AVG(volume) OVER (PARTITION BY ticker) as avg_volume
+                        FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                        WHERE {year_filter_sql}
+                          AND close > {price_threshold}
+                          {ticker_filter}
+                          AND close IS NOT NULL
+                          AND volume IS NOT NULL
+                    ),
+                    stock_performance AS (
+                        SELECT 
+                            ticker,
+                            MAX(CASE WHEN first_row = 1 THEN close END) as first_close,
+                            MAX(CASE WHEN last_row = 1 THEN close END) as last_close,
+                            MAX(trading_days) as trading_days,
+                            MAX(avg_volume) as avg_volume
+                        FROM yearly_prices
+                        GROUP BY ticker
+                        HAVING MAX(trading_days) >= 50
+                           AND MAX(avg_volume) > {volume_threshold}
+                    )
+                    SELECT 
+                        ticker,
+                        ROUND(((last_close - first_close) / first_close * 100), 2) as percentage_change,
+                        first_close,
+                        last_close,
+                        trading_days,
+                        ROUND(avg_volume, 0) as avg_volume
+                    FROM stock_performance
+                    WHERE first_close > 0 
+                      AND last_close > 0
+                      AND ((last_close - first_close) / first_close * 100) BETWEEN -95 AND 300
+                    {order_by}
+                    LIMIT {limit}
+                    """
+                    
+                    with st.expander("🔍 Generated SQL (Hardcoded Safe Query)"):
+                        st.code(sql_query, language="sql")
+                    
                     try:
                         result_df = run_query(sql_query)
                         if result_df.empty:
-                            st.info("No stocks matched your screening criteria.")
-                            st.stop()
+                            st.warning(f"""
+                            No stocks found matching criteria for {year_label}.
                             
-                        st.dataframe(result_df, use_container_width=True)
+                            This could mean:
+                            - Year is too old/new for database coverage
+                            - All stocks filtered out by quality checks
+                            - Database has limited data for this period
+                            
+                            Try a different year (1980-2023) or broader search.
+                            """)
+                            st.stop()
                         
-                        insight_prompt = f"""You are a financial analyst evaluating a stock screen.
+                        # Additional post-query validation
+                        max_change = result_df['PERCENTAGE_CHANGE'].max()
+                        min_change = result_df['PERCENTAGE_CHANGE'].min()
+                        
+                        if max_change > 300 or min_change < -95:
+                            st.warning(f"""
+                            ⚠️ **Data Quality Check Failed**
+                            
+                            Detected values outside safe bounds:
+                            - Max: {max_change:.1f}%
+                            - Min: {min_change:.1f}%
+                            
+                            Re-filtering to realistic ranges...
+                            """)
+                            
+                            result_df = result_df[
+                                (result_df['PERCENTAGE_CHANGE'] >= -95) & 
+                                (result_df['PERCENTAGE_CHANGE'] <= 300)
+                            ].reset_index(drop=True)
+                            
+                            if result_df.empty:
+                                st.error("All results were outside realistic bounds. Query failed validation.")
+                                st.stop()
+                        
+                        # Display results
+                        display_cols = ['TICKER', 'PERCENTAGE_CHANGE', 'FIRST_CLOSE', 'LAST_CLOSE', 'TRADING_DAYS']
+                        if 'VOLATILITY' in result_df.columns:
+                            display_cols.append('VOLATILITY')
+                        if 'AVG_VOLUME' in result_df.columns:
+                            display_cols.append('AVG_VOLUME')
+                            
+                        display_df = result_df[display_cols].copy()
+                        
+                        col_map = {
+                            'TICKER': 'Ticker', 
+                            'PERCENTAGE_CHANGE': 'Return (%)', 
+                            'FIRST_CLOSE': 'Start Price', 
+                            'LAST_CLOSE': 'End Price', 
+                            'TRADING_DAYS': 'Trading Days',
+                            'VOLATILITY': 'Volat (SD)',
+                            'AVG_VOLUME': 'Avg Vol'
+                        }
+                        display_df.columns = [col_map.get(c, c) for c in display_df.columns]
+                        
+                        if 'Return (%)' in display_df.columns:
+                            display_df['Return (%)'] = display_df['Return (%)'].apply(lambda x: f"{x:+.2f}%")
+                        if 'Start Price' in display_df.columns:
+                            display_df['Start Price'] = display_df['Start Price'].apply(lambda x: f"${x:.2f}")
+                        if 'End Price' in display_df.columns:
+                            display_df['End Price'] = display_df['End Price'].apply(lambda x: f"${x:.2f}")
+                        if 'Avg Vol' in display_df.columns:
+                            display_df['Avg Vol'] = display_df['Avg Vol'].apply(lambda x: f"{x:,.0f}")
+                        
+                        st.dataframe(display_df, use_container_width=True, hide_index=True)
+                        
+                        # Chart
+                        if len(result_df) > 1:
+                            fig = px.bar(
+                                result_df.head(10),
+                                x='TICKER',
+                                y='PERCENTAGE_CHANGE',
+                                title=f"Top {limit} Performers in {year_label}",
+                                labels={'PERCENTAGE_CHANGE': 'Return (%)', 'TICKER': 'Stock'},
+                                color='PERCENTAGE_CHANGE',
+                                color_continuous_scale=['red', 'yellow', 'green']
+                            )
+                            fig.update_layout(
+                                paper_bgcolor=T['plotly_paper'],
+                                plot_bgcolor=T['plotly_plot'],
+                                font=dict(color=T['plotly_text']),
+                                xaxis=dict(gridcolor=T['plotly_grid']),
+                                yaxis=dict(gridcolor=T['plotly_grid']),
+                                height=400
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        # AI Analysis
+                        data_summary = result_df.head(10).to_string()
+                        insight_prompt = f"""You are a senior financial analyst at Goldman Sachs.
+
 User asked: {prompt}
-Data returned (top 10 rows):
-{result_df.head(10).to_string()}
-Write a 3-sentence summary explaining why these types of stocks fit the criteria or market context for this period. Use emojis like 🚀 for big winners if applicable."""
+
+Top {limit} performers in {year_label}:
+{data_summary}
+
+Write a 3-4 sentence professional analysis explaining:
+1. What sector/industry dominated
+2. Why these stocks performed well (market context for {year_label})
+3. Key trends or patterns in the data
+
+Be specific with numbers. Use professional Wall Street analyst tone."""
                         
                         insights, insight_model = call_llm(insight_prompt, "analysis")
                         ib = "⚡ Groq" if insight_model == "groq" else "🛡️ Cortex"
                         
+                        # Sentiment
                         ins_lower = insights.lower()
-                        bull_words = ["up", "gains", "positive", "outperforming", "bullish", "higher", "surge", "doubled"]
-                        bear_words = ["down", "decline", "negative", "underperforming", "bearish", "lower", "drop"]
+                        bull_words = ["up", "gains", "positive", "outperforming", "bullish", "higher", "surge", "growth"]
+                        bear_words = ["down", "decline", "negative", "underperforming", "bearish", "lower", "drop", "loss"]
                         bull_count = sum(1 for w in bull_words if w in ins_lower)
                         bear_count = sum(1 for w in bear_words if w in ins_lower)
                         
-                        sentiment_html = ""
                         if bull_count > bear_count:
                             sentiment_html = '<span style="background-color:rgba(46,125,50,0.2);color:#81c784;border:1px solid #2e7d32;padding:2px 8px;border-radius:12px;font-size:0.8em;">🟢 BULLISH SCREEN</span>'
                         elif bear_count > bull_count:
                             sentiment_html = '<span style="background-color:rgba(198,40,40,0.2);color:#e57373;border:1px solid #c62828;padding:2px 8px;border-radius:12px;font-size:0.8em;">🔴 BEARISH SCREEN</span>'
                         else:
                             sentiment_html = '<span style="background-color:rgba(249,168,37,0.2);color:#fff59d;border:1px solid #f9a825;padding:2px 8px;border-radius:12px;font-size:0.8em;">🟡 NEUTRAL SCREEN</span>'
-
+                        
                         st.markdown(f'{sentiment_html}<br><div class="insight-box"><div class="insight-label">⬡ AI Analysis — {ib} Intelligence</div>{insights}</div>', unsafe_allow_html=True)
                         
+                        # Download
                         csv = result_df.to_csv(index=False)
-                        st.download_button("📥 Download Results", csv, "screener_results.csv", "text/csv", key=f"dl_new_{len(st.session_state.messages)}")
+                        st.download_button("📥 Download Results", csv, f"top_{limit}_{year_label}.csv", "text/csv", key=f"dl_screener_{len(st.session_state.messages)}")
                         
                         st.session_state.messages.append({
-                            "role": "assistant", "content": f'{sentiment_html}<br>{insights}',
-                            "sql": sql_query, "data": result_df,
+                            "role": "assistant",
+                            "content": f'{sentiment_html}<br>{insights}',
+                            "sql": sql_query,
+                            "data": result_df,
                             "id": len(st.session_state.messages)
                         })
-                    except Exception as sql_err:
-                        st.warning(f"Screener query error: {sql_err}")
                         
+                        # After displaying results, add educational note
+                        if use_major_filter:
+                            with st.expander("💡 Want to see small-cap stocks?"):
+                                st.markdown("""
+                                This search filtered to major stocks (S&P 500 + top liquid stocks) 
+                                to show mainstream market leaders.
+                                
+                                **To see ALL stocks including small-caps:**
+                                - Add "small cap" to your query
+                                - Example: "Top small cap biotech stocks in 2022"
+                                - Example: "Best penny stocks in 2021"
+                                
+                                **To search a specific ticker:**
+                                - Just mention the ticker symbol
+                                - Example: "HNRG performance in 2022"
+                                """)
+                        else:
+                            with st.expander("ℹ️ About small-cap results"):
+                                st.markdown("""
+                                This search included **all stocks** (small-cap, mid-cap, large-cap).
+                                
+                                Small-cap stocks can show higher returns but also:
+                                - Higher volatility and risk
+                                - Lower liquidity (harder to buy/sell)
+                                - Less analyst coverage
+                                - More data quality issues
+                                
+                                **To see only major stocks:**
+                                - Add "major stocks" or "S&P 500" to your query
+                                - Example: "Top 5 major stocks in 2022"
+                                """)
+                        
+                    except Exception as sql_err:
+                        st.error(f"Screener query failed: {sql_err}")
+                        st.caption("Try a different query or year range.")
+                
+                else:
+                    # Non-percentage screener - use LLM for generic queries
+                    sql_prompt = f"""You are a SQL expert for stock market data.
+Database: FINANCE_AI_DB.STOCK_DATA.PRICES
+Columns: date, ticker, open, high, low, close, volume
+
+User question: {prompt}
+
+Generate a Snowflake SQL query to answer this.
+- ALWAYS filter: WHERE close > 1.0 (no penny stocks)
+- LIMIT results to 20 rows
+- Use proper date functions for Snowflake
+
+Return ONLY SQL, no markdown."""
+                    
+                    sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                    
+                    if ';' in sql_query:
+                        sql_query = sql_query.split(';')[0].strip()
+                    
+                    with st.expander("🔍 Generated SQL"):
+                        st.code(sql_query, language="sql")
+                    
+                    try:
+                        result_df = run_query(sql_query)
+                        
+                        if result_df.empty:
+                            st.info("No results found for this query.")
+                            st.stop()
+                        
+                        st.dataframe(result_df, use_container_width=True)
+                        
+                        # Simple analysis
+                        insight_prompt = f"""Briefly explain these stock screening results:
+
+User asked: {prompt}
+Results (top 5 rows):
+{result_df.head().to_string()}
+
+2-3 sentences."""
+                        
+                        insights, model = call_llm(insight_prompt, "analysis")
+                        badge = "⚡ GROQ" if model == "groq" else "🛡️ CORTEX"
+                        
+                        st.markdown(f'<div class="insight-box"><div class="insight-label">⬡ Analysis — {badge}</div>{insights}</div>', unsafe_allow_html=True)
+                        
+                        csv = result_df.to_csv(index=False)
+                        st.download_button("📥 Download", csv, "results.csv", "text/csv", key=f"dl_{len(st.session_state.messages)}")
+                        
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": insights,
+                            "sql": sql_query,
+                            "data": result_df,
+                            "id": len(st.session_state.messages)
+                        })
+                        
+                    except Exception as e:
+                        st.error(f"Query failed: {e}")
+                    
             except Exception as e:
                 st.error(f"Error processing context: {e}")
 
