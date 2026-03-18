@@ -1206,7 +1206,9 @@ Classify the user query and return ONLY valid JSON (no markdown, no explanation)
 Rules:
 - "top/best stocks today" → gainers_today
 - "worst/bottom stocks today" → losers_today
-- "top stocks this week" → gainers_today (period handled separately)
+- "top stocks this week" or "last week" → gainers_today, period="5d"
+- "top stocks last month" → gainers_today, period="1mo"
+- "last 3 months" → gainers_today, period="3mo"
 - "best stocks 2022" → best_year, year=2022
 - "worst stocks 2022" → worst_year, year=2022
 - "show me AAPL" or single company name → stock_info, tickers=["AAPL"]
@@ -1256,7 +1258,10 @@ User query: "{user_query}"
     if period and fn in ("compare", "performance_period"): extras.append(f"Period: {period}")
     if sector: extras.append(f"Sector: {sector}")
     extra_str = " | ".join(extras) if extras else "Today"
-    st.info(f"🤖 **AI Decision:** {fn_display} | {extra_str} | Market: {market.upper()} | Limit: {limit}")
+    # Don't show the default badge for gainers_today with rolling periods
+    # it will be overridden by the specific timeframe badge below
+    if not (fn == "gainers_today" and period in ("5d", "1wk", "1w", "1mo", "3mo")):
+        st.info(f"🤖 **AI Decision:** {fn_display} | {extra_str} | Market: {market.upper()} | Limit: {limit}")
 
     # Execute the chosen function
     result_df = pd.DataFrame()
@@ -1264,9 +1269,44 @@ User query: "{user_query}"
     query_type = "historical"
 
     if fn == "gainers_today":
-        result_df = yf_get_top_gainers_today(limit=limit, market=market)
-        data_source = "yahoo_finance_intraday"
-        query_type = "intraday"
+        period = decision.get("period", "1d")
+        if period in ("5d", "1wk", "1w", "1mo", "3mo"):
+            # Unified rolling performance screener
+            period_str = "5d" if period in ("5d", "1wk", "1w") else period
+            
+            def _fetch_period_single(ticker):
+                try:
+                    hist = yf.Ticker(ticker).history(period=period_str)
+                    if len(hist) >= 2:
+                        ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+                        return {
+                            "TICKER": ticker,
+                            "PERCENTAGE_CHANGE": round(ret, 2),
+                            "START_PRICE": round(hist['Close'].iloc[0], 2),
+                            "END_PRICE": round(hist['Close'].iloc[-1], 2),
+                            "TRADING_DAYS": len(hist),
+                            "AVG_VOLUME": int(hist['Volume'].mean()),
+                        }
+                except:
+                    pass
+                return None
+                
+            tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
+            results = _yf_concurrent_fetch(tickers_pool, _fetch_period_single, f"movers over {period_str}")
+            results.sort(key=lambda x: x['PERCENTAGE_CHANGE'], reverse=True)
+            result_df = pd.DataFrame(results[:limit])
+            
+            # Dynamic badging
+            badge_title = {"5d": "Gainers This Week", "1mo": "Gainers This Month", "3mo": "Gainers This Quarter"}.get(period_str, "Gainers")
+            ds_key = {"5d": "yahoo_finance_weekly", "1mo": "yahoo_finance_monthly", "3mo": "yahoo_finance_quarterly"}.get(period_str)
+            
+            st.info(f"🤖 **AI Decision:** {badge_title} | Period: {period_str} | Market: {market.upper()} | Limit: {limit}")
+            data_source = ds_key
+            query_type = "historical"  # reuse existing historical col_map
+        else:
+            result_df = yf_get_top_gainers_today(limit=limit, market=market)
+            data_source = "yahoo_finance_intraday"
+            query_type = "intraday"
 
     elif fn == "losers_today":
         result_df = yf_get_top_losers_today(limit=limit, market=market)
@@ -1755,6 +1795,29 @@ If it mentions 'banking stocks', return: ["JPM","BAC","GS","MS","WFC","C"]
 If no specific stocks are mentioned, return an empty array [].
 Max 10 tickers.
 
+CRITICAL INDIAN STOCK MAPPING (never map these to US tickers):
+- Reliance Industries / Reliance → RELIANCE.NS (NOT RIG, NOT REL)
+- Infosys / Infy → INFY.NS
+- TCS / Tata Consultancy → TCS.NS
+- HDFC Bank / HDFC → HDFCBANK.NS
+- ICICI Bank / ICICI → ICICIBANK.NS
+- Wipro → WIPRO.NS
+- SBI / State Bank of India → SBIN.NS
+- L&T / Larsen / Larsen and Toubro → LT.NS
+- Kotak / Kotak Bank → KOTAKBANK.NS
+- Axis Bank → AXISBANK.NS
+- Sun Pharma → SUNPHARMA.NS
+- Bajaj Finance → BAJFINANCE.NS
+- HCL / HCL Tech → HCLTECH.NS
+- Tech Mahindra → TECHM.NS
+- Maruti / Maruti Suzuki → MARUTI.NS
+- Titan → TITAN.NS
+- Airtel / Bharti Airtel → BHARTIARTL.NS
+- ITC → ITC.NS
+- ONGC → ONGC.NS
+- Adani → ADANIENT.NS
+Always append .NS for Indian NSE stocks. Never map Indian company names to US tickers.
+
 Question: {question}
 
 Return ONLY the JSON array:"""
@@ -2153,11 +2216,22 @@ def smart_ticker_lookup(search_input):
         # Retail / Consumer
         'walmart': 'WMT', 'target': 'TGT', 'costco': 'COST',
         'home depot': 'HD', 'lowes': 'LOW', "lowe's": 'LOW',
-        # Indian Stocks
-        'reliance': 'RELIANCE.NS', 'reliance industries': 'RELIANCE.NS',
-        'infosys': 'INFY.NS', 'tata consultancy': 'TCS.NS', 'tcs': 'TCS.NS',
+        # Indian Stocks (NSE)
+        'reliance': 'RELIANCE.NS', 'reliance industries': 'RELIANCE.NS', 'ril': 'RELIANCE.NS',
+        'infosys': 'INFY.NS', 'infy': 'INFY.NS',
+        'tata consultancy': 'TCS.NS', 'tata consultancy services': 'TCS.NS', 'tcs': 'TCS.NS',
         'hdfc bank': 'HDFCBANK.NS', 'hdfc': 'HDFCBANK.NS',
         'wipro': 'WIPRO.NS', 'icici': 'ICICIBANK.NS', 'icici bank': 'ICICIBANK.NS',
+        'axis bank': 'AXISBANK.NS', 'sbi': 'SBIN.NS', 'state bank': 'SBIN.NS',
+        'state bank of india': 'SBIN.NS', 'bajaj finance': 'BAJFINANCE.NS',
+        'titan': 'TITAN.NS', 'asian paints': 'ASIANPAINT.NS',
+        'hcl': 'HCLTECH.NS', 'hcl tech': 'HCLTECH.NS', 'tech mahindra': 'TECHM.NS',
+        'maruti': 'MARUTI.NS', 'maruti suzuki': 'MARUTI.NS',
+        'larsen': 'LT.NS', 'larsen and toubro': 'LT.NS', 'l&t': 'LT.NS',
+        'kotak': 'KOTAKBANK.NS', 'kotak bank': 'KOTAKBANK.NS', 'kotak mahindra': 'KOTAKBANK.NS',
+        'adani': 'ADANIENT.NS', 'bharti airtel': 'BHARTIARTL.NS', 'airtel': 'BHARTIARTL.NS',
+        'sun pharma': 'SUNPHARMA.NS', 'dr reddy': 'DRREDDY.NS', 'dr reddys': 'DRREDDY.NS',
+        'ongc': 'ONGC.NS', 'ntpc': 'NTPC.NS', 'power grid': 'POWERGRID.NS', 'itc': 'ITC.NS',
         'nike': 'NKE', 'starbucks': 'SBUX', 'mcdonalds': 'MCD',
         "mcdonald's": 'MCD', 'coca cola': 'KO', 'coca-cola': 'KO',
         'coke': 'KO', 'pepsi': 'PEP', 'pepsico': 'PEP',
@@ -4183,8 +4257,22 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                     tickers = []  # Force empty → falls through to LLM agent screener
                     extraction_model = "groq"  # default badge
                 else:
-                    # Step 1: Extract tickers from the question
-                    tickers, extraction_model = extract_tickers_from_question(prompt)
+                    # DATE RANGE BYPASS: queries with specific date ranges go to LLM agent
+                    date_range_signals = ['between', 'from january', 'from feb', 'from march',
+                                          'from april', 'from may', 'from june', 'from july',
+                                          'from august', 'from september', 'from october',
+                                          'from november', 'from december', 'january to',
+                                          'jan to', 'feb to', 'last month', 'last quarter',
+                                          'last 3 months', 'last 6 months', 'last year',
+                                          'perform', 'performed', 'performance']
+                    has_date_range_intent = any(w in prompt_lower for w in date_range_signals)
+
+                    if has_date_range_intent:
+                        tickers = []  # Force to LLM agent which handles performance_period correctly
+                        extraction_model = "groq"
+                    else:
+                        # Step 1: Extract tickers from the question
+                        tickers, extraction_model = extract_tickers_from_question(prompt)
                 ai_badge_class = "badge-groq" if extraction_model == "groq" else "badge-mistral"
                 ai_badge_text = "⚡ GROQ" if extraction_model == "groq" else "🛡️ MISTRAL"
                 
@@ -4608,6 +4696,9 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
                             "snowflake": "💾 **Snowflake Database** | Historical market data (1962-2024)",
                             "yahoo_finance": "📡 **Yahoo Finance API** | Year-to-date real-time data",
                             "yahoo_finance_intraday": "📡 **Yahoo Finance API** | Today's intraday performance",
+                            "yahoo_finance_weekly": "📡 **Yahoo Finance API** | 5-day weekly performance",
+                            "yahoo_finance_monthly": "📡 **Yahoo Finance API** | 30-day monthly performance",
+                            "yahoo_finance_quarterly": "📡 **Yahoo Finance API** | 90-day quarterly performance",
                             "yahoo_screener": "🚀 **Yahoo Fast Screener** | Pre-screened instant results"
                         }
                         badge_html = f"""
@@ -4695,6 +4786,7 @@ REAL DATA (source: Yahoo Finance, fetched just now):
 {data_context}
 
 {depth_instructions[depth_label]}
+IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
 Highlight the biggest mover and any notable pattern.
 Every number must come directly from the data above."""
                         elif query_type == "stock_info":
@@ -4706,6 +4798,7 @@ REAL DATA (source: Yahoo Finance, fetched just now):
 {data_context}
 
 {depth_instructions[depth_label]} covering current price, 52-week range, and sector context.
+IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
 Use only the exact numbers shown above."""
                         elif query_type == "historical":
                             analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real performance data below.
@@ -4716,6 +4809,7 @@ REAL DATA (source: Yahoo Finance):
 {data_context}
 
 {depth_instructions[depth_label]}. Reference exact percentage returns and prices from the data.
+IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
 Identify the top performer and any notable outlier.
 Every number must come directly from the data above."""
                         else:
