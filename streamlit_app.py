@@ -118,6 +118,15 @@ ALL_MID_CAP = US_MID_CAP_EXTENDED + INDIAN_MID_CAP
 LARGE_CAP_UNIVERSE = FULL_COVERAGE + INDIAN_LARGE_CAP
 EXTENDED_UNIVERSE = LARGE_CAP_UNIVERSE + ALL_MID_CAP
 
+SECTOR_MAP = {
+    "tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "ADBE", "NFLX", "CSCO", "AMD", "QCOM", "TXN", "INTC", "ORCL", "CRM", "AVGO", "IBM", "AMAT", "LRCX", "KLAC", "MRVL", "SNOW", "PLTR", "DDOG", "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS"],
+    "finance": ["JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "C", "BLK", "SPGI", "AXP", "USB", "PNC", "SCHW", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "BAJAJFINANCE.NS"],
+    "energy": ["CVX", "XOM", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "HES", "DVN", "HAL", "PXD", "MRO", "APA", "FANG", "OVV", "CTRA", "BKR", "NOV", "RELIANCE.NS", "ONGC.NS"],
+    "healthcare": ["JNJ", "UNH", "ABBV", "MRK", "TMO", "ABT", "PFE", "BMY", "AMGN", "GILD", "REGN", "ISRG", "CI", "CVS", "ELV", "SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS"],
+    "consumer": ["WMT", "PG", "HD", "KO", "PEP", "COST", "NKE", "SBUX", "MCD", "TGT", "LOW", "TJX", "DIS", "CMCSA", "TITAN.NS", "HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "MARUTI.NS", "M&M.NS"],
+    "industrial": ["BA", "CAT", "GE", "HON", "UNP", "DE", "LMT", "RTX", "NOC", "LT.NS"]
+}
+
 def get_smart_ticker_universe(user_query, query_type):
     query_lower = user_query.lower()
     
@@ -1278,6 +1287,10 @@ User query: "{user_query}"
                 try:
                     hist = yf.Ticker(ticker).history(period=period_str)
                     if len(hist) >= 2:
+                        hist = hist.copy()
+                        # Only localize if timezone exists to avoid TypeError
+                        if hist.index.tz is not None:
+                            hist.index = hist.index.tz_localize(None)
                         ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
                         return {
                             "TICKER": ticker,
@@ -1292,15 +1305,23 @@ User query: "{user_query}"
                 return None
                 
             tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
+            # Apply sector filter if requested
+            if sector and sector.lower() in SECTOR_MAP:
+                target_sector = sector.lower()
+                tickers_pool = [t for t in tickers_pool if t in SECTOR_MAP[target_sector]]
+                if not tickers_pool: # Fallback to mapped list if pool filter results in empty
+                    tickers_pool = SECTOR_MAP[target_sector]
+            
             results = _yf_concurrent_fetch(tickers_pool, _fetch_period_single, f"movers over {period_str}")
             results.sort(key=lambda x: x['PERCENTAGE_CHANGE'], reverse=True)
             result_df = pd.DataFrame(results[:limit])
             
             # Dynamic badging
+            sector_str = f" ({target_sector.title()})" if sector and sector.lower() in SECTOR_MAP else ""
             badge_title = {"5d": "Gainers This Week", "1mo": "Gainers This Month", "3mo": "Gainers This Quarter"}.get(period_str, "Gainers")
             ds_key = {"5d": "yahoo_finance_weekly", "1mo": "yahoo_finance_monthly", "3mo": "yahoo_finance_quarterly"}.get(period_str)
             
-            st.info(f"🤖 **AI Decision:** {badge_title} | Period: {period_str} | Market: {market.upper()} | Limit: {limit}")
+            st.info(f"🤖 **AI Decision:** {badge_title}{sector_str} | Period: {period_str} | Market: {market.upper()} | Limit: {limit}")
             data_source = ds_key
             query_type = "historical"  # reuse existing historical col_map
         else:
@@ -1309,9 +1330,24 @@ User query: "{user_query}"
             query_type = "intraday"
 
     elif fn == "losers_today":
-        result_df = yf_get_top_losers_today(limit=limit, market=market)
-        data_source = "yahoo_finance_intraday"
-        query_type = "intraday"
+        tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
+        if sector and sector.lower() in SECTOR_MAP:
+            target_sector = sector.lower()
+            tickers_pool = [t for t in tickers_pool if t in SECTOR_MAP[target_sector]]
+            if not tickers_pool: tickers_pool = SECTOR_MAP[target_sector]
+            
+        result_df = yf_get_top_losers_today(limit=limit, market=market) # Note: currently uses static helper, let's make it consistent
+        # For now, if sector is provided, we should probably fetch it using the same rolling logic but for 1d
+        if sector:
+            # Reusing the rolling logic logic for 1d losers
+            results = _yf_concurrent_fetch(tickers_pool, _fetch_period_single, "sector losers", period_str="1d")
+            results.sort(key=lambda x: x['PERCENTAGE_CHANGE']) # ASC for losers
+            result_df = pd.DataFrame(results[:limit])
+            query_type = "historical"
+        else:
+            result_df = yf_get_top_losers_today(limit=limit, market=market)
+            data_source = "yahoo_finance_intraday"
+            query_type = "intraday"
 
     elif fn == "best_year" and year:
         result_df = yf_get_best_stocks_year(year=year, limit=limit, market=market)
@@ -1692,7 +1728,10 @@ def fetch_yahoo_data(ticker):
             "Low": "LOW", "Close": "CLOSE", "Volume": "VOLUME"
         })
         df["TICKER"] = ticker.upper()
-        df["DATE"] = pd.to_datetime(df["DATE"]).dt.tz_localize(None)
+        df["DATE"] = pd.to_datetime(df["DATE"])
+        # Only remove timezone if it exists (prevents TypeError on tz-naive data like Indian stocks)
+        if df["DATE"].dt.tz is not None:
+            df["DATE"] = df["DATE"].dt.tz_localize(None)
         df = df[["DATE", "TICKER", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]]
         df = df.sort_values("DATE").reset_index(drop=True)
         
@@ -1790,8 +1829,8 @@ def check_ticker_in_db(ticker):
 def extract_tickers_from_question(question):
     """Use LLM to extract ticker symbols from natural language"""
     prompt = f"""Extract stock ticker symbols from this question. Return ONLY a JSON array of uppercase ticker symbols, nothing else.
-If the question mentions company names, convert to tickers. If it mentions 'tech stocks', return: ["AAPL","MSFT","GOOGL","META","NVDA","TSLA","AMZN","NFLX","AMD","INTC"]
-If it mentions 'banking stocks', return: ["JPM","BAC","GS","MS","WFC","C"]
+If the question mentions company names, convert to tickers. If it mentions 'tech stocks', return top 10 from: AAPL, MSFT, GOOGL, NVDA, META, TSLA, AMZN, NFLX, AVGO, ADBE.
+If it mentions 'banking stocks', return: JPM, BAC, GS, MS, WFC, C.
 If no specific stocks are mentioned, return an empty array [].
 Max 10 tickers.
 
