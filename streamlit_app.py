@@ -1291,12 +1291,20 @@ User query: "{user_query}"
                         # Only localize if timezone exists to avoid TypeError
                         if hist.index.tz is not None:
                             hist.index = hist.index.tz_localize(None)
-                        ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+                        # Drop rows with NaN Close prices (e.g. KLAC delisted/missing data)
+                        hist = hist.dropna(subset=['Close'])
+                        if len(hist) < 2:
+                            return None
+                        start_price = hist['Close'].iloc[0]
+                        end_price = hist['Close'].iloc[-1]
+                        if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
+                            return None
+                        ret = ((end_price - start_price) / start_price) * 100
                         return {
                             "TICKER": ticker,
                             "PERCENTAGE_CHANGE": round(ret, 2),
-                            "START_PRICE": round(hist['Close'].iloc[0], 2),
-                            "END_PRICE": round(hist['Close'].iloc[-1], 2),
+                            "START_PRICE": round(start_price, 2),
+                            "END_PRICE": round(end_price, 2),
                             "TRADING_DAYS": len(hist),
                             "AVG_VOLUME": int(hist['Volume'].mean()),
                         }
@@ -1330,20 +1338,38 @@ User query: "{user_query}"
             query_type = "intraday"
 
     elif fn == "losers_today":
-        tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
         if sector and sector.lower() in SECTOR_MAP:
             target_sector = sector.lower()
+            tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
             tickers_pool = [t for t in tickers_pool if t in SECTOR_MAP[target_sector]]
-            if not tickers_pool: tickers_pool = SECTOR_MAP[target_sector]
+            if not tickers_pool:
+                tickers_pool = SECTOR_MAP[target_sector]
             
-        result_df = yf_get_top_losers_today(limit=limit, market=market) # Note: currently uses static helper, let's make it consistent
-        # For now, if sector is provided, we should probably fetch it using the same rolling logic but for 1d
-        if sector:
-            # Reusing the rolling logic logic for 1d losers
-            results = _yf_concurrent_fetch(tickers_pool, _fetch_period_single, "sector losers", period_str="1d")
-            results.sort(key=lambda x: x['PERCENTAGE_CHANGE']) # ASC for losers
+            def _fetch_loser(ticker):
+                try:
+                    hist = yf.Ticker(ticker).history(period="5d")
+                    if len(hist) >= 2:
+                        hist = hist.dropna(subset=['Close'])
+                        if len(hist) < 2:
+                            return None
+                        ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+                        return {
+                            "TICKER": ticker,
+                            "PERCENTAGE_CHANGE": round(ret, 2),
+                            "START_PRICE": round(hist['Close'].iloc[0], 2),
+                            "END_PRICE": round(hist['Close'].iloc[-1], 2),
+                            "TRADING_DAYS": len(hist),
+                            "AVG_VOLUME": int(hist['Volume'].mean()),
+                        }
+                except:
+                    pass
+                return None
+            
+            results = _yf_concurrent_fetch(tickers_pool, _fetch_loser, f"sector losers")
+            results.sort(key=lambda x: x['PERCENTAGE_CHANGE'])  # ASC for losers
             result_df = pd.DataFrame(results[:limit])
             query_type = "historical"
+            data_source = "yahoo_finance_intraday"
         else:
             result_df = yf_get_top_losers_today(limit=limit, market=market)
             data_source = "yahoo_finance_intraday"
@@ -1524,7 +1550,12 @@ def cortex_complete(prompt):
     result = run_query(f"""
         SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large', '{safe}') as response
     """)
-    return result.iloc[0]['RESPONSE']
+    response = result.iloc[0]['RESPONSE']
+    # Strip Mistral formatting artifacts that leak into the output
+    import re
+    response = re.sub(r'\[/?INST\]', '', response)
+    response = re.sub(r'<\/?s>', '', response)
+    return response.strip()
 
 # ─── API KEY MANAGEMENT ───────────────────────────────────────────────────────
 def get_fmp_api_key():
@@ -1906,6 +1937,35 @@ def smart_data_router(tickers, fmp_key):
     today = datetime.now().date()
     
     for ticker in tickers:
+        # ─── INTERNATIONAL TICKER SHORTCUT ───
+        # FMP doesn't support non-US exchanges (.NS, .BO, .L, .TO, etc.)
+        # Route directly to Yahoo Finance to avoid false "not found" errors
+        intl_suffixes = ('.NS', '.BO', '.L', '.TO', '.AX', '.HK', '.T', '.SS', '.SZ')
+        if any(ticker.upper().endswith(sfx) for sfx in intl_suffixes):
+            if yfinance_available:
+                yf_df, yf_err = fetch_yahoo_data(ticker)
+                if yf_err is None and len(yf_df) > 0:
+                    results[ticker] = {
+                        "source": "api",
+                        "badge": "🟡 YAHOO",
+                        "last_date": None,
+                        "rows": 0,
+                        "api_data": yf_df,
+                        "error": None
+                    }
+                    continue
+            # Yahoo also failed for this international ticker
+            results[ticker] = {
+                "source": "not_found",
+                "badge": "❌ NOT FOUND",
+                "last_date": None,
+                "rows": 0,
+                "api_data": None,
+                "error": f"No data available for {ticker}",
+                "suggestions": suggest_similar_tickers(ticker)
+            }
+            continue
+        
         exists, last_date, row_count, db_ok = check_ticker_in_db(ticker)
         
         if not db_ok:
@@ -4805,6 +4865,8 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
 
                         # AI Analysis — grounded to real fetched data only
                         # TRUNCATION: send head(10) to avoid context bloat and massive payloads
+                        # Drop any rows with NaN in critical columns before display/analysis
+                        result_df = result_df.dropna(subset=[c for c in result_df.columns if c in ['PERCENTAGE_CHANGE', 'START_PRICE', 'END_PRICE', 'CLOSE', 'CURRENT_PRICE']], how='any')
                         data_context = result_df.head(10).to_string(index=False)
                         
                         depth_label, max_sentences = get_analysis_depth(user_query, len(result_df))
