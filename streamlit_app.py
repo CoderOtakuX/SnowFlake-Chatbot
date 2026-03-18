@@ -2108,6 +2108,11 @@ def smart_ticker_lookup(search_input):
         # Retail / Consumer
         'walmart': 'WMT', 'target': 'TGT', 'costco': 'COST',
         'home depot': 'HD', 'lowes': 'LOW', "lowe's": 'LOW',
+        # Indian Stocks
+        'reliance': 'RELIANCE.NS', 'reliance industries': 'RELIANCE.NS',
+        'infosys': 'INFY.NS', 'tata consultancy': 'TCS.NS', 'tcs': 'TCS.NS',
+        'hdfc bank': 'HDFCBANK.NS', 'hdfc': 'HDFCBANK.NS',
+        'wipro': 'WIPRO.NS', 'icici': 'ICICIBANK.NS', 'icici bank': 'ICICIBANK.NS',
         'nike': 'NKE', 'starbucks': 'SBUX', 'mcdonalds': 'MCD',
         "mcdonald's": 'MCD', 'coca cola': 'KO', 'coca-cola': 'KO',
         'coke': 'KO', 'pepsi': 'PEP', 'pepsico': 'PEP',
@@ -4109,7 +4114,7 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                                 
                             badges_html += sentiment_html
                             
-                            final_output = f"{badges_html}<br>{html_card}\n{analysis_html}" if "html_card" in locals() else f"{badges_html}<br>{analysis_html}"
+                            final_output = f"{html_card}\n{sentiment_html}\n{analysis_html}"
                             st.markdown(final_output, unsafe_allow_html=True)
                             st.session_state.messages.append({"role": "assistant", "content": final_output})
                             st.stop()
@@ -4117,7 +4122,8 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                 # SCREENER BYPASS: screener intent skips ticker extraction
                 prompt_lower = prompt.lower()
                 screener_words = ['top', 'best', 'worst', 'gainers', 'losers', 'bottom',
-                                  'highest', 'lowest', 'most', 'biggest', 'leading']
+                                  'highest', 'lowest', 'most', 'biggest', 'leading',
+                                  'perform', 'performed', 'performance']
                 market_words = ['stocks', 'performers', 'companies', 'shares', 'movers']
                 has_screener_intent = (
                     any(w in prompt_lower for w in screener_words) and
@@ -4562,8 +4568,41 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
                         
                         st.dataframe(display_df, use_container_width=True, hide_index=True)
                         
+                        def get_analysis_depth(query: str, df_rows: int) -> tuple[str, int]:
+                            """Returns (depth_label, max_sentences) based on query complexity."""
+                            query_lower = query.lower()
+                            
+                            complex_signals = [
+                                'compare', 'vs', 'versus', 'between', 'why', 'reason',
+                                'explain', 'analyse', 'analyze', 'trend', 'pattern',
+                                'nifty', 'sector', 'all', 'portfolio'
+                            ]
+                            simple_signals = [
+                                'price', 'current', 'today', 'quick', 'show me', 'what is'
+                            ]
+                            
+                            complexity_score = sum(1 for w in complex_signals if w in query_lower)
+                            simplicity_score = sum(1 for w in simple_signals if w in query_lower)
+                            
+                            # More rows = more to analyze
+                            if df_rows > 15 or complexity_score >= 2:
+                                return "detailed", 6
+                            elif df_rows > 5 or complexity_score == 1:
+                                return "moderate", 4
+                            else:
+                                return "brief", 2
+
                         # AI Analysis — grounded to real fetched data only
                         data_context = result_df.to_string(index=False)
+                        
+                        depth_label, max_sentences = get_analysis_depth(user_query, len(result_df))
+
+                        depth_instructions = {
+                            "brief": "Write 2 sentences maximum. Be direct and specific.",
+                            "moderate": "Write 3-4 sentences. Cover the key finding and one notable pattern.",
+                            "detailed": "Write 5-6 sentences. Cover: top performer, notable patterns, sector themes, any outliers, and one actionable insight."
+                        }
+                        
                         if query_type == "intraday":
                             analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real market data below.
 DO NOT use any prior knowledge for specific prices, percentages, or dates.
@@ -4573,8 +4612,9 @@ QUERY: {user_query}
 REAL DATA (source: Yahoo Finance, fetched just now):
 {data_context}
 
-Write 3-4 sentences. Reference specific tickers and exact figures from the data above.
-Highlight the biggest mover and any notable pattern."""
+{depth_instructions[depth_label]}
+Highlight the biggest mover and any notable pattern.
+Every number must come directly from the data above."""
                         elif query_type == "stock_info":
                             analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real stock data below.
 DO NOT invent or recall any prices, percentages, or dates not present in this data.
@@ -4583,7 +4623,7 @@ QUERY: {user_query}
 REAL DATA (source: Yahoo Finance, fetched just now):
 {data_context}
 
-Write 3-4 sentences covering current price, 52-week range, and sector context.
+{depth_instructions[depth_label]} covering current price, 52-week range, and sector context.
 Use only the exact numbers shown above."""
                         elif query_type == "historical":
                             analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real performance data below.
@@ -4593,8 +4633,9 @@ QUERY: {user_query}
 REAL DATA (source: Yahoo Finance):
 {data_context}
 
-Write 3-4 sentences. Reference exact percentage returns and prices from the data.
-Identify the top performer and any notable outlier."""
+{depth_instructions[depth_label]}. Reference exact percentage returns and prices from the data.
+Identify the top performer and any notable outlier.
+Every number must come directly from the data above."""
                         else:
                             analysis_prompt = f"""You are a financial analyst. Analyze ONLY this real market data.
 DO NOT invent any figures — every number must come from the data below.
@@ -4603,7 +4644,8 @@ QUERY: {user_query}
 REAL DATA:
 {data_context}
 
-Write 3-4 sentences with specific numbers from the data above."""
+{depth_instructions[depth_label]} with specific numbers from the data above.
+Every number must come directly from the data."""
                         insights, model = call_llm(analysis_prompt, "analysis")
                         badge = "⚡ Groq" if model == "groq" else "🛡️ Cortex"
                         st.markdown(f'<div class="insight-box"><div class="insight-label">⬡ AI Analysis — {badge}</div>{insights}</div>', unsafe_allow_html=True)
