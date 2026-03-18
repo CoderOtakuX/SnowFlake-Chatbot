@@ -10,6 +10,7 @@ import json
 import os
 import re
 import numpy as np
+from tenacity import retry, stop_after_attempt, wait_exponential
 try:
     import yfinance as yf
     yfinance_available = True
@@ -26,7 +27,36 @@ MAJOR_STOCKS = [
     'AMD', 'QCOM', 'BMY', 'SPY', 'QQQ', 'OXY', 'XOM', 'MPC', 'HES', 'COP'
 ]
 
-# Market cap tiers (industry standard)
+# Custom CSS for glassmorphism and skeletons
+st.markdown("""
+<style>
+    /* Skeleton Loader Animation */
+    @keyframes skeleton-loading {
+        0% { background-color: rgba(255, 255, 255, 0.05); }
+        100% { background-color: rgba(255, 255, 255, 0.15); }
+    }
+    .skeleton-line {
+        height: 20px;
+        margin-bottom: 15px;
+        border-radius: 4px;
+        animation: skeleton-loading 1s linear infinite alternate;
+        width: 100%;
+    }
+    .skeleton-box {
+        height: 150px;
+        margin-bottom: 25px;
+        border-radius: 8px;
+        animation: skeleton-loading 1s linear infinite alternate;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+def render_skeleton():
+    """Renders a simple skeleton UI while waiting for data."""
+    st.markdown('<div class="skeleton-line" style="width: 80%;"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="skeleton-box"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="skeleton-line"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="skeleton-line" style="width: 60%;"></div>', unsafe_allow_html=True)
 MEGA_CAP = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B']
 
 LARGE_CAP = MEGA_CAP + [
@@ -999,6 +1029,8 @@ def _yf_concurrent_fetch(tickers, worker_fn, label="stocks"):
     status_text.empty()
     return results
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@st.cache_data(ttl=300)
 def yf_get_top_gainers_today(limit=10, market="us"):
     """Get today's top gaining stocks (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
@@ -1006,6 +1038,8 @@ def yf_get_top_gainers_today(limit=10, market="us"):
     results.sort(key=lambda x: x['TODAY_CHANGE'], reverse=True)
     return pd.DataFrame(results[:limit])
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@st.cache_data(ttl=300)
 def yf_get_top_losers_today(limit=10, market="us"):
     """Get today's top losing stocks (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
@@ -1013,6 +1047,8 @@ def yf_get_top_losers_today(limit=10, market="us"):
     results.sort(key=lambda x: x['TODAY_CHANGE'])  # ascending = worst first
     return pd.DataFrame(results[:limit])
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+@st.cache_data(ttl=3600)
 def yf_get_best_stocks_year(year, limit=10, market="us"):
     """Get best performing stocks for a specific year (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
@@ -1021,6 +1057,8 @@ def yf_get_best_stocks_year(year, limit=10, market="us"):
     results.sort(key=lambda x: x['PERCENTAGE_CHANGE'], reverse=True)
     return pd.DataFrame(results[:limit])
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+@st.cache_data(ttl=3600)
 def yf_get_worst_stocks_year(year, limit=10, market="us"):
     """Get worst performing stocks for a specific year (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
@@ -1030,6 +1068,8 @@ def yf_get_worst_stocks_year(year, limit=10, market="us"):
     return pd.DataFrame(results[:limit])
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@st.cache_data(ttl=3600)
 def yf_get_stock_info(ticker: str) -> pd.DataFrame:
     """Deep-dive single stock: price, 52wk range, volume, P/E, sector."""
     try:
@@ -1057,6 +1097,8 @@ def yf_get_stock_info(ticker: str) -> pd.DataFrame:
         return pd.DataFrame([{"ERROR": str(e), "TICKER": ticker}])
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
+@st.cache_data(ttl=3600)
 def yf_compare_stocks(tickers_list: list, period: str = "1mo") -> pd.DataFrame:
     """Compare multiple stocks side-by-side over a period."""
     import concurrent.futures as cf
@@ -1087,6 +1129,8 @@ def yf_compare_stocks(tickers_list: list, period: str = "1mo") -> pd.DataFrame:
     return df
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+@st.cache_data(ttl=3600)
 def yf_get_performance_period(ticker: str, period: str = "1mo") -> pd.DataFrame:
     """
     Single stock: returns full daily OHLCV history for the period
@@ -1432,6 +1476,7 @@ if "groq_calls_today" not in st.session_state:
     st.session_state.groq_calls_today = 0
 
 # ─── SMART LLM ROUTER ────────────────────────────────────────────────────────
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def call_llm(prompt, task_type="general"):
     """Try Groq first (fast), fall back to Mistral (reliable)"""
     global groq_available
@@ -4059,8 +4104,12 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing..."):
-            try:
+        # Skeleton UI for AI Analysis
+        analysis_placeholder = st.empty()
+        with analysis_placeholder.container():
+            st.caption("🤖 AI analysing your query...")
+            render_skeleton()
+        try:
                 # Enhancement 1: Intercept ROI / Investment queries
                 if any(word in prompt.lower() for word in ['invested', 'invest', 'worth', 'roi']):
                     roi_params = extract_roi_params(prompt)
@@ -4304,14 +4353,26 @@ Generate the SQL now:"""
                             with st.expander("🔍 Generated SQL"):
                                 st.code(sql_query, language="sql")
                             try:
-                                with st.spinner("💾 Querying Snowflake Data Cloud..."):
+                                # Skeleton UI for Snowflake Query
+                                db_placeholder = st.empty()
+                                with db_placeholder.container():
+                                    st.caption("💾 Accessing Snowflake Data Cloud...")
+                                    render_skeleton()
+                                try:
                                     result_df = run_query(sql_query)
+                                finally:
+                                    db_placeholder.empty()
 
                                 # FALLBACK: If DB is empty and user asked for recent data, try fetching from API
                                 if (result_df is None or result_df.empty) and any(year in prompt for year in ['2023', '2024', '2025', '2026', 'today', 'now', 'recent']):
                                     st.info("📡 DB returned no results for recent timeframe. Fetching live market data...")
                                     progress_bar = st.progress(0)
-                                    with st.spinner(f"🔄 Fetching data for {len(db_tickers) if db_tickers else 'major'} stocks..."):
+                                    # Skeleton UI for Yahoo Finance Fetch
+                                    yf_placeholder = st.empty()
+                                    with yf_placeholder.container():
+                                        st.caption(f"🔄 Fetching data for {len(db_tickers) if db_tickers else 'major'} stocks...")
+                                        render_skeleton()
+                                    try:
                                         api_fallback_dfs = []
                                         # Use a subset of major stocks if no specific tickers found or if searching for "best"
                                         fetch_targets = db_tickers if db_tickers else MAJOR_STOCKS[:15]
@@ -4332,7 +4393,9 @@ Generate the SQL now:"""
                                         if api_fallback_dfs:
                                             result_df = pd.concat(api_fallback_dfs, ignore_index=True)
                                             st.success("✅ Successfully retrieved live data from API fallback.")
-                                    progress_bar.empty()
+                                    finally:
+                                        yf_placeholder.empty()
+                                        progress_bar.empty()
 
                                 if not result_df.empty:
                                     # Check for unrealistic percentage values
@@ -4441,13 +4504,31 @@ Your code:"""
                                 try:
                                     # Safe evaluation context
                                     original_df = result_df.copy()
-                                    local_env = {"df": result_df.copy(), "pd": pd}
-                                    exec(f"filtered_df = {filter_code}", {}, local_env)
-                                    result_df = local_env.get("filtered_df", result_df)
-                                    if isinstance(result_df, pd.Series):
-                                        result_df = result_df.to_frame()
-                                    elif isinstance(result_df, (int, float, str, np.number)):
-                                        result_df = pd.DataFrame({"Result": [result_df]})
+                                    try:
+                                        # Use pd.eval which is safer than exec() as it only evaluates expressions
+                                        # and doesn't allow arbitrary statement execution.
+                                        # We specifically instruct the LLM to provide a pandas filter expression.
+                                        if "df" in filter_code:
+                                            # If the LLM provided a full statement like 'df[df["col"] > 0]', 
+                                            # eval it directly.
+                                            result_df = pd.eval(filter_code, target=result_df, engine='python')
+                                        else:
+                                            # If it's just the condition like 'df["col"] > 0', use it to filter
+                                            condition = pd.eval(filter_code, target=result_df, engine='python')
+                                            result_df = result_df[condition]
+                                            
+                                        if isinstance(result_df, pd.Series):
+                                            result_df = result_df.to_frame()
+                                        elif isinstance(result_df, (int, float, str, np.number, bool)):
+                                            result_df = pd.DataFrame({"Result": [result_df]})
+                                    except Exception as eval_err:
+                                        # Fallback to query() if eval fails (sometimes simpler for LLMs)
+                                        try:
+                                            # Strip 'df[' and ']' if LLM was too verbose
+                                            clean_query = filter_code.replace('df[', '').rstrip(']')
+                                            result_df = result_df.query(clean_query)
+                                        except:
+                                            result_df = original_df 
                                         
                                     if result_df.empty and not original_df.empty:
                                         result_df = original_df # Fallback if AI filtering aggressively deleted everything
@@ -4593,7 +4674,8 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
                                 return "brief", 2
 
                         # AI Analysis — grounded to real fetched data only
-                        data_context = result_df.to_string(index=False)
+                        # TRUNCATION: send head(10) to avoid context bloat and massive payloads
+                        data_context = result_df.head(10).to_string(index=False)
                         
                         depth_label, max_sentences = get_analysis_depth(user_query, len(result_df))
 
@@ -4657,8 +4739,10 @@ Every number must come directly from the data."""
 
 
 
-            except Exception as e:
-                st.error(f"Error processing request: {e}")
+        except Exception as e:
+            st.error(f"Error processing request: {e}")
+        finally:
+            analysis_placeholder.empty()
 
 # Clear chat
 if st.session_state.messages:
