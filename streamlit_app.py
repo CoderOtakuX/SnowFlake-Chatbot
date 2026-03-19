@@ -1040,20 +1040,40 @@ def _yf_concurrent_fetch(tickers, worker_fn, label="stocks"):
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 @st.cache_data(ttl=300)
-def yf_get_top_gainers_today(limit=10, market="us"):
+def yf_get_top_gainers_today(limit=10, market="us", sector=None, sort_by_volume=False):
     """Get today's top gaining stocks (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
+    if sector and sector.lower() in SECTOR_MAP:
+        target_sector = sector.lower()
+        tickers = [t for t in tickers if t in SECTOR_MAP[target_sector]]
+        if not tickers: tickers = sorted(SECTOR_MAP[target_sector])
+        
     results = _yf_concurrent_fetch(tickers, _yf_fetch_intraday_single, "today's movers")
-    results.sort(key=lambda x: x['TODAY_CHANGE'], reverse=True)
+    
+    if sort_by_volume:
+        results.sort(key=lambda x: x.get('TODAY_VOLUME', 0), reverse=True)
+    else:
+        results.sort(key=lambda x: x.get('TODAY_CHANGE', 0), reverse=True)
+        
     return pd.DataFrame(results[:limit])
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 @st.cache_data(ttl=300)
-def yf_get_top_losers_today(limit=10, market="us"):
+def yf_get_top_losers_today(limit=10, market="us", sector=None, sort_by_volume=False):
     """Get today's top losing stocks (concurrent)."""
     tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-    results = _yf_concurrent_fetch(tickers, _yf_fetch_intraday_single, "today's movers")
-    results.sort(key=lambda x: x['TODAY_CHANGE'])  # ascending = worst first
+    if sector and sector.lower() in SECTOR_MAP:
+        target_sector = sector.lower()
+        tickers = [t for t in tickers if t in SECTOR_MAP[target_sector]]
+        if not tickers: tickers = sorted(SECTOR_MAP[target_sector])
+        
+    results = _yf_concurrent_fetch(tickers, _yf_fetch_intraday_single, "today's losers")
+    
+    if sort_by_volume:
+        results.sort(key=lambda x: x.get('TODAY_VOLUME', 0), reverse=True)
+    else:
+        results.sort(key=lambda x: x.get('TODAY_CHANGE', 0))  # ascending = worst first
+        
     return pd.DataFrame(results[:limit])
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
@@ -1333,7 +1353,8 @@ User query: "{user_query}"
             data_source = ds_key
             query_type = "historical"  # reuse existing historical col_map
         else:
-            result_df = yf_get_top_gainers_today(limit=limit, market=market)
+            sort_vol = "volume" in user_query.lower() or "active" in user_query.lower()
+            result_df = yf_get_top_gainers_today(limit=limit, market=market, sector=sector, sort_by_volume=sort_vol)
             data_source = "yahoo_finance_intraday"
             query_type = "intraday"
 
@@ -1371,7 +1392,8 @@ User query: "{user_query}"
             query_type = "historical"
             data_source = "yahoo_finance_intraday"
         else:
-            result_df = yf_get_top_losers_today(limit=limit, market=market)
+            sort_vol = "volume" in user_query.lower() or "active" in user_query.lower()
+            result_df = yf_get_top_losers_today(limit=limit, market=market, sector=sector, sort_by_volume=sort_vol)
             data_source = "yahoo_finance_intraday"
             query_type = "intraday"
 
@@ -4049,44 +4071,87 @@ if selected_tickers:
                   AND date BETWEEN '{date_from}' AND '{date_to}'
                 ORDER BY date
             """)
-            price_data['DATE'] = pd.to_datetime(price_data['DATE'])
+            
+            needs_yf_fallback = False
+            last_db_date = None
+            
+            if price_data is None or price_data.empty:
+                needs_yf_fallback = True
+                fetch_start = date_from
+            else:
+                price_data['DATE'] = pd.to_datetime(price_data['DATE'])
+                last_db_date = price_data['DATE'].max()
+                # If DB data is stale (ends more than 5 days before date_to)
+                if pd.to_datetime(date_to) - last_db_date > pd.Timedelta(days=5):
+                    needs_yf_fallback = True
+                    fetch_start = last_db_date + pd.Timedelta(days=1)
+                
+            if needs_yf_fallback:
+                yf_chart_dfs = []
+                for t in selected_tickers:
+                    try:
+                        hist = yf.Ticker(t).history(start=str(fetch_start.date() if hasattr(fetch_start, 'date') else fetch_start), end=str(date_to))
+                        if not hist.empty:
+                            df_t = hist.reset_index()[['Date', 'Close']].copy()
+                            df_t.columns = ['DATE', 'CLOSE']
+                            df_t['TICKER'] = t
+                            df_t['DATE'] = pd.to_datetime(df_t['DATE'])
+                            if df_t['DATE'].dt.tz is not None:
+                                df_t['DATE'] = df_t['DATE'].dt.tz_localize(None)
+                            yf_chart_dfs.append(df_t)
+                    except Exception:
+                        pass
+                if yf_chart_dfs:
+                    yf_data = pd.concat(yf_chart_dfs, ignore_index=True)
+                    if price_data is not None and not price_data.empty:
+                        price_data = pd.concat([price_data, yf_data], ignore_index=True).drop_duplicates(subset=['DATE', 'TICKER'])
+                        price_data = price_data.sort_values(['TICKER', 'DATE'])
+                    else:
+                        price_data = yf_data
 
-            fig = go.Figure()
-            colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6',
-                      '#F39C12', '#1ABC9C', '#E67E22']
+            if price_data is not None and not price_data.empty:
+                if 'DATE' not in price_data.columns:
+                    price_data.columns = [c.upper() for c in price_data.columns]
+                price_data['DATE'] = pd.to_datetime(price_data['DATE'])
+                
+                fig = go.Figure()
+                colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6',
+                          '#F39C12', '#1ABC9C', '#E67E22']
 
-            for i, ticker in enumerate(selected_tickers):
-                df_t = price_data[price_data['TICKER'] == ticker]
-                if len(df_t) > 0:
-                    fig.add_trace(go.Scatter(
-                        x=df_t['DATE'], y=df_t['CLOSE'],
-                        name=ticker, mode='lines',
-                        line=dict(color=colors[i % len(colors)], width=1.8),
-                        hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %d, %Y}}<br>$%{{y:.2f}}<extra></extra>"
-                    ))
+                for i, ticker in enumerate(selected_tickers):
+                    df_t = price_data[price_data['TICKER'] == ticker]
+                    if len(df_t) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=df_t['DATE'], y=df_t['CLOSE'],
+                            name=ticker, mode='lines',
+                            line=dict(color=colors[i % len(colors)], width=1.8),
+                            hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %d, %Y}}<br>${{y:.2f}}<extra></extra>"
+                        ))
 
-            fig.update_layout(
-                paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                font=dict(family='DM Sans', color=T['plotly_text'], size=11),
-                legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'],
-                           borderwidth=1, font=dict(size=11)),
-                xaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
-                           tickfont=dict(family='JetBrains Mono', size=10),
-                           zeroline=False, showspikes=True, spikecolor=T['gold'],
-                           spikethickness=1, spikedash='dot'),
-                yaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
-                           tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10),
-                           zeroline=False, showspikes=True, spikecolor=T['gold'],
-                           spikethickness=1, spikedash='dot'),
-                hovermode='x unified',
-                margin=dict(l=10, r=10, t=20, b=10),
-                height=420,
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                fig.update_layout(
+                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                    font=dict(family='DM Sans', color=T['plotly_text'], size=11),
+                    legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'],
+                               borderwidth=1, font=dict(size=11)),
+                    xaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                               tickfont=dict(family='JetBrains Mono', size=10),
+                               zeroline=False, showspikes=True, spikecolor=T['gold'],
+                               spikethickness=1, spikedash='dot'),
+                    yaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                               tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10),
+                               zeroline=False, showspikes=True, spikecolor=T['gold'],
+                               spikethickness=1, spikedash='dot'),
+                    hovermode='x unified',
+                    margin=dict(l=10, r=10, t=20, b=10),
+                    height=420,
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-            # Export button
-            csv_data = price_data.to_csv(index=False)
-            st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
+                # Export button
+                csv_data = price_data.to_csv(index=False)
+                st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
+            else:
+                st.info("No price data available for the selected tickers and date range.")
 
         except Exception as e:
             pass
@@ -4550,36 +4615,96 @@ Generate the SQL now:"""
                                 finally:
                                     db_placeholder.empty()
 
-                                # FALLBACK: If DB is empty and user asked for recent data, try fetching from API
-                                if (result_df is None or result_df.empty) and any(year in prompt for year in ['2023', '2024', '2025', '2026', 'today', 'now', 'recent']):
-                                    st.info("📡 DB returned no results for recent timeframe. Fetching live market data...")
+                                # FALLBACK: If DB is empty, try fetching from Yahoo Finance directly
+                                if (result_df is None or result_df.empty):
+                                    st.info("📡 DB returned no results. Fetching live market data from Yahoo Finance...")
                                     progress_bar = st.progress(0)
-                                    # Skeleton UI for Yahoo Finance Fetch
                                     yf_placeholder = st.empty()
                                     with yf_placeholder.container():
                                         st.caption(f"🔄 Fetching data for {len(db_tickers) if db_tickers else 'major'} stocks...")
                                         render_skeleton()
                                     try:
                                         api_fallback_dfs = []
-                                        # Use a subset of major stocks if no specific tickers found or if searching for "best"
                                         fetch_targets = db_tickers if db_tickers else MAJOR_STOCKS[:15]
+                                        
+                                        # Detect date range from the prompt for targeted fetching
+                                        import re as _re
+                                        year_matches = _re.findall(r'20[12]\d', prompt)
+                                        if year_matches:
+                                            start_year = min(int(y) for y in year_matches)
+                                            end_year = max(int(y) for y in year_matches)
+                                            fetch_start = f"{start_year}-01-01"
+                                            fetch_end = f"{end_year + 1}-01-01"
+                                        else:
+                                            fetch_start = "2024-01-01"
+                                            fetch_end = None  # defaults to today
+                                        
                                         for i, t in enumerate(fetch_targets):
-                                            # Skip if already in api_dfs from router
-                                            if any(not df.empty and df['TICKER'].iloc[0] == t for df in api_dfs):
-                                                continue
-                                            
-                                            # Update progress
                                             progress_bar.progress((i + 1) / len(fetch_targets))
-                                            
-                                            fallback_df, fallback_err = fetch_live_data(t, fmp_api_key)
-                                            if fallback_err is None and not fallback_df.empty:
-                                                api_fallback_dfs.append(fallback_df)
-                                                # Mark as cached for next time (simulate cache detection for the info box)
-                                                st.session_state[f"api_cache_{t}"] = True
+                                            try:
+                                                stock = yf.Ticker(t)
+                                                if fetch_end:
+                                                    hist = stock.history(start=fetch_start, end=fetch_end)
+                                                else:
+                                                    hist = stock.history(start=fetch_start)
+                                                if not hist.empty:
+                                                    df = hist.reset_index()
+                                                    df = df.rename(columns={
+                                                        'Date': 'DATE', 'Open': 'OPEN', 'High': 'HIGH',
+                                                        'Low': 'LOW', 'Close': 'CLOSE', 'Volume': 'VOLUME'
+                                                    })
+                                                    df['TICKER'] = t.upper()
+                                                    df['DATE'] = pd.to_datetime(df['DATE'])
+                                                    if df['DATE'].dt.tz is not None:
+                                                        df['DATE'] = df['DATE'].dt.tz_localize(None)
+                                                    df = df[['DATE', 'TICKER', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']]
+                                                    api_fallback_dfs.append(df)
+                                            except Exception:
+                                                pass
                                         
                                         if api_fallback_dfs:
                                             result_df = pd.concat(api_fallback_dfs, ignore_index=True)
-                                            st.success("✅ Successfully retrieved live data from API fallback.")
+                                            has_api_data = True
+                                            
+                                            # Detect "month by month" queries and aggregate
+                                            monthly_keywords = ['month by month', 'monthly', 'month-by-month', 'each month', 'per month']
+                                            is_monthly = any(kw in prompt.lower() for kw in monthly_keywords)
+                                            
+                                            if is_monthly and 'CLOSE' in result_df.columns:
+                                                result_df['DATE'] = pd.to_datetime(result_df['DATE'])
+                                                result_df['Year'] = result_df['DATE'].dt.year
+                                                result_df['Month'] = result_df['DATE'].dt.strftime('%B')
+                                                
+                                                monthly_close = result_df.groupby(['TICKER', 'Year', 'Month']).agg(
+                                                    Close=('CLOSE', 'last'),
+                                                    High=('HIGH', 'max'),
+                                                    Low=('LOW', 'min'),
+                                                    Avg_Volume=('VOLUME', 'mean')
+                                                ).reset_index()
+                                                
+                                                # Pivot: rows=Month, columns=Year (Close)
+                                                month_order = ['January', 'February', 'March', 'April', 'May', 'June',
+                                                              'July', 'August', 'September', 'October', 'November', 'December']
+                                                monthly_close['Month'] = pd.Categorical(monthly_close['Month'], categories=month_order, ordered=True)
+                                                monthly_close = monthly_close.sort_values(['Year', 'Month'])
+                                                
+                                                if len(fetch_targets) == 1:
+                                                    # Single ticker: pivot by year
+                                                    pivot_df = monthly_close.pivot_table(
+                                                        index='Month', columns='Year', values='Close', aggfunc='last'
+                                                    )
+                                                    pivot_df = pivot_df.reindex(month_order)
+                                                    pivot_df = pivot_df.dropna(how='all')
+                                                    pivot_df.columns = [f"{int(y)} (Close)" for y in pivot_df.columns]
+                                                    pivot_df = pivot_df.applymap(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+                                                    pivot_df.index.name = 'Month'
+                                                    result_df = pivot_df.reset_index()
+                                                else:
+                                                    # Multiple tickers: show monthly close for each
+                                                    monthly_close['Close'] = monthly_close['Close'].apply(lambda x: f"${x:,.2f}")
+                                                    result_df = monthly_close[['TICKER', 'Month', 'Year', 'Close']]
+                                            
+                                            st.success(f"✅ Successfully retrieved Yahoo Finance data ({len(result_df)} rows)")
                                     finally:
                                         yf_placeholder.empty()
                                         progress_bar.empty()
