@@ -4440,7 +4440,7 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                 ai_badge_class = "badge-groq" if extraction_model == "groq" else "badge-mistral"
                 ai_badge_text = "⚡ GROQ" if extraction_model == "groq" else "🛡️ MISTRAL"
                 
-                # Smart defaults based on keywords
+                # Smart defaults based on query keywords
                 prompt_lower = prompt.lower()
                 
                 # Determine sort preference from query keywords
@@ -4548,10 +4548,13 @@ CRITICAL RULES:
 1. Use ONLY Snowflake SQL syntax. Use CURRENT_DATE() not CURDATE(). Use DATE_FROM_PARTS() not MAKEDATE().
 2. Generate EXACTLY ONE SQL SELECT statement. No semicolons. No UNION. No multiple queries.
 3. Do NOT output any markdown, backticks, or conversational text (no "Note:", no explanations).
-4. For 'today' or 'this year', get the MOST RECENT data available.
-5. For multi-stock comparisons, use WHERE ticker IN ('TICK1','TICK2',...) — do NOT use separate queries.
-6. For time-series queries (trends, performance, comparison over time): return raw daily rows with date, ticker, and price columns. Do NOT aggregate into a single row per ticker. Use ORDER BY date and LIMIT {dynamic_limit}.
-7. For non-time-series queries, LIMIT results to 50 rows.
+4. The `ticker` column is a STRING, so compare with quotes (e.g., ticker = 'AAPL'). Use exact matches.
+5. Price calculations MUST handle potential 0/NULL values securely. e.g., NO division by zero. Use NULLIF.
+6. For 'today' or 'this year', get the MOST RECENT data available.
+7. For multi-stock comparisons, use WHERE ticker IN ('TICK1','TICK2',...) — do NOT use separate queries.
+8. For time-series queries (trends, performance, comparison over time): return raw daily rows with date, ticker, and close columns. Do NOT aggregate into a single row per ticker. Use ORDER BY date and LIMIT {dynamic_limit}.
+   EXCEPTION: If the user explicitly asks for "month by month" or "monthly", you MUST use GROUP BY DATE_TRUNC('MONTH', date) as DATE and AVG(close) as AVG_CLOSE. Replace 'date' with 'DATE' in SELECT. Do NOT use LIMIT for month-by-month queries.
+9. For non-time-series queries, LIMIT results to 50 rows.
 Generate the SQL now:"""
                             
                             sql_query, _ = call_llm(sql_prompt, "sql_generation")
@@ -4774,12 +4777,59 @@ Generate the SQL now:"""
                                         # Only append API data that is NEWER than the Snowflake data
                                         # This prevents appending 2024 API data when the user explicitly queried 2022
                                         if pd.notna(max_db_date):
-                                            # We check if the user seems to want current data (by if recent data was requested/implied)
-                                            # We will just append the API data that falls chronologically *after* our Snowflake data
+                                            # Check if there is a massive gap (e.g. max_db_date is 2023, but we are in 2026)
+                                            # If the query asks for present data, fetch the missing historical chunk from Yahoo Finance.
+                                            import datetime as _dt
+                                            fetch_end_needed = False
+                                            present_kw = ['present', 'today', 'now', 'current', str(pd.Timestamp.now().year)]
+                                            
+                                            if any(kw in prompt.lower() for kw in present_kw) or ('fetch_end' in locals() and fetch_end is None):
+                                                fetch_end_needed = True
+                                            
+                                            if fetch_end_needed and max_db_date < pd.Timestamp.now() - pd.Timedelta(days=14):
+                                                st.caption(f"🔄 Appending missing data from {max_db_date.strftime('%Y-%m-%d')} to present via Yahoo Finance...")
+                                                gap_dfs = []
+                                                for t in db_tickers:
+                                                    try:
+                                                        hist = yf.Ticker(t).history(start=max_db_date.strftime('%Y-%m-%d'))
+                                                        if not hist.empty:
+                                                            df = hist.reset_index()
+                                                            df = df.rename(columns={'Date': 'DATE', 'Open': 'OPEN', 'High': 'HIGH', 'Low': 'LOW', 'Close': 'CLOSE', 'Volume': 'VOLUME'})
+                                                            df['TICKER'] = t.upper()
+                                                            df['DATE'] = pd.to_datetime(df['DATE']).dt.tz_localize(None)
+                                                            gap_dfs.append(df)
+                                                    except Exception:
+                                                        pass
+                                                if gap_dfs:
+                                                    gap_combined = pd.concat(gap_dfs, ignore_index=True)
+                                                    # Aggregate if month-by-month
+                                                    monthly_kw = ['month by month', 'monthly', 'month-by-month', 'each month', 'per month']
+                                                    if any(kw in prompt.lower() for kw in monthly_kw):
+                                                        gap_combined['MONTH'] = gap_combined['DATE'].dt.to_period('M').dt.to_timestamp()
+                                                        monthly_gap = gap_combined.groupby(['TICKER', 'MONTH']).agg(CLOSE=('CLOSE', 'mean'), LAST_CLOSE=('CLOSE', 'last')).reset_index()
+                                                        
+                                                        current_month_ts = pd.Timestamp(_dt.datetime.now()).to_period('M').to_timestamp()
+                                                        mask = monthly_gap['MONTH'] == current_month_ts
+                                                        monthly_gap.loc[mask, 'CLOSE'] = monthly_gap.loc[mask, 'LAST_CLOSE']
+                                                        monthly_gap = monthly_gap.drop(columns=['LAST_CLOSE'])
+                                                        
+                                                        monthly_gap = monthly_gap.rename(columns={'MONTH': 'DATE'})
+                                                        gap_combined = monthly_gap
+                                                        if 'AVG_CLOSE' in result_df.columns:
+                                                            gap_combined = gap_combined.rename(columns={'CLOSE': 'AVG_CLOSE'})
+                                                    
+                                                    gap_common_cols = list(set(result_df.columns) & set(gap_combined.columns))
+                                                    new_gap_data = gap_combined[gap_combined['DATE'] > max_db_date]
+                                                    if not new_gap_data.empty and gap_common_cols:
+                                                        result_df = pd.concat([result_df, new_gap_data[gap_common_cols]], ignore_index=True)
+                                                        max_db_date = result_df['DATE'].max() # Update max_db_date so FMP merge doesn't duplicate recent day
+                                            
+                                            # Normal FMP live data append
                                             new_api_data = api_combined[api_combined['DATE'] > max_db_date]
                                             
                                             if not new_api_data.empty:
                                                 result_df = pd.concat([result_df, new_api_data[common_cols]], ignore_index=True)
+
                                                 
                                                 # Ensure DATE and TICKER exist before dropping duplicates across them
                                                 if 'DATE' in result_df.columns and 'TICKER' in result_df.columns:
