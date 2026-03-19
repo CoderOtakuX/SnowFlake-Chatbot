@@ -10,7 +10,6 @@ import json
 import os
 import re
 import numpy as np
-from tenacity import retry, stop_after_attempt, wait_exponential
 try:
     import yfinance as yf
     yfinance_available = True
@@ -27,36 +26,7 @@ MAJOR_STOCKS = [
     'AMD', 'QCOM', 'BMY', 'SPY', 'QQQ', 'OXY', 'XOM', 'MPC', 'HES', 'COP'
 ]
 
-# Custom CSS for glassmorphism and skeletons
-st.markdown("""
-<style>
-    /* Skeleton Loader Animation */
-    @keyframes skeleton-loading {
-        0% { background-color: rgba(255, 255, 255, 0.05); }
-        100% { background-color: rgba(255, 255, 255, 0.15); }
-    }
-    .skeleton-line {
-        height: 20px;
-        margin-bottom: 15px;
-        border-radius: 4px;
-        animation: skeleton-loading 1s linear infinite alternate;
-        width: 100%;
-    }
-    .skeleton-box {
-        height: 150px;
-        margin-bottom: 25px;
-        border-radius: 8px;
-        animation: skeleton-loading 1s linear infinite alternate;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-def render_skeleton():
-    """Renders a simple skeleton UI while waiting for data."""
-    st.markdown('<div class="skeleton-line" style="width: 80%;"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="skeleton-box"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="skeleton-line"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="skeleton-line" style="width: 60%;"></div>', unsafe_allow_html=True)
+# Market cap tiers (industry standard)
 MEGA_CAP = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B']
 
 LARGE_CAP = MEGA_CAP + [
@@ -117,15 +87,6 @@ INDIAN_MID_CAP = [
 ALL_MID_CAP = US_MID_CAP_EXTENDED + INDIAN_MID_CAP
 LARGE_CAP_UNIVERSE = FULL_COVERAGE + INDIAN_LARGE_CAP
 EXTENDED_UNIVERSE = LARGE_CAP_UNIVERSE + ALL_MID_CAP
-
-SECTOR_MAP = {
-    "tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "ADBE", "NFLX", "CSCO", "AMD", "QCOM", "TXN", "INTC", "ORCL", "CRM", "AVGO", "IBM", "AMAT", "LRCX", "KLAC", "MRVL", "SNOW", "PLTR", "DDOG", "TCS.NS", "INFY.NS", "WIPRO.NS", "HCLTECH.NS", "TECHM.NS"],
-    "finance": ["JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "C", "BLK", "SPGI", "AXP", "USB", "PNC", "SCHW", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "AXISBANK.NS", "KOTAKBANK.NS", "BAJAJFINANCE.NS"],
-    "energy": ["CVX", "XOM", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY", "HES", "DVN", "HAL", "PXD", "MRO", "APA", "FANG", "OVV", "CTRA", "BKR", "NOV", "RELIANCE.NS", "ONGC.NS"],
-    "healthcare": ["JNJ", "UNH", "ABBV", "MRK", "TMO", "ABT", "PFE", "BMY", "AMGN", "GILD", "REGN", "ISRG", "CI", "CVS", "ELV", "SUNPHARMA.NS", "DRREDDY.NS", "CIPLA.NS"],
-    "consumer": ["WMT", "PG", "HD", "KO", "PEP", "COST", "NKE", "SBUX", "MCD", "TGT", "LOW", "TJX", "DIS", "CMCSA", "TITAN.NS", "HINDUNILVR.NS", "ITC.NS", "NESTLEIND.NS", "MARUTI.NS", "M&M.NS"],
-    "industrial": ["BA", "CAT", "GE", "HON", "UNP", "DE", "LMT", "RTX", "NOC", "LT.NS"]
-}
 
 def get_smart_ticker_universe(user_query, query_type):
     query_lower = user_query.lower()
@@ -970,474 +931,6 @@ def fetch_intraday_performance(tickers, limit=10, sort_by=None, user_query=""):
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# NEW: Yahoo Finance Tool Functions (LLM Agent Backend)
-# All use ThreadPoolExecutor for speed and return DataFrames with
-# column names matching the existing STEP 5 visualization expectations.
-# ═══════════════════════════════════════════════════════════════════════
-
-def _yf_fetch_intraday_single(ticker):
-    """Fetch 2-day history for one ticker (thread pool worker)."""
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="2d")
-        if len(hist) >= 2:
-            yc = hist['Close'].iloc[-2]
-            tc = hist['Close'].iloc[-1]
-            pct = ((tc - yc) / yc) * 100
-            return {
-                "TICKER": ticker,
-                "TODAY_CHANGE": round(pct, 2),
-                "YESTERDAY_CLOSE": round(yc, 2),
-                "CURRENT_PRICE": round(tc, 2),
-                "TODAY_VOLUME": int(hist['Volume'].iloc[-1]),
-            }
-    except Exception:
-        pass
-    return None
-
-def _yf_fetch_yearly_single(ticker, year):
-    """Fetch yearly performance for one ticker (thread pool worker)."""
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(start=f"{year}-01-01", end=f"{year}-12-31")
-        if len(hist) >= 50:
-            sp = hist['Close'].iloc[0]
-            ep = hist['Close'].iloc[-1]
-            ret = ((ep - sp) / sp) * 100
-            if -95 <= ret <= 500:
-                return {
-                    "TICKER": ticker,
-                    "PERCENTAGE_CHANGE": round(ret, 2),
-                    "START_PRICE": round(sp, 2),
-                    "END_PRICE": round(ep, 2),
-                    "AVG_VOLUME": int(hist['Volume'].mean()),
-                }
-    except Exception:
-        pass
-    return None
-
-def _yf_concurrent_fetch(tickers, worker_fn, label="stocks"):
-    """Run worker_fn across tickers with progress bar + ThreadPoolExecutor."""
-    import concurrent.futures as cf
-    results = []
-    total = len(tickers)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    completed = 0
-    with cf.ThreadPoolExecutor(max_workers=20) as pool:
-        futures = {pool.submit(worker_fn, t): t for t in tickers}
-        for future in cf.as_completed(futures):
-            completed += 1
-            progress_bar.progress(completed / total)
-            status_text.text(f"📊 Scanning {label}… ({completed}/{total})")
-            res = future.result()
-            if res is not None:
-                results.append(res)
-    progress_bar.empty()
-    status_text.empty()
-    return results
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-@st.cache_data(ttl=300)
-def yf_get_top_gainers_today(limit=10, market="us", sector=None, sort_by_volume=False):
-    """Get today's top gaining stocks (concurrent)."""
-    tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-    if sector and sector.lower() in SECTOR_MAP:
-        target_sector = sector.lower()
-        tickers = [t for t in tickers if t in SECTOR_MAP[target_sector]]
-        if not tickers: tickers = sorted(SECTOR_MAP[target_sector])
-        
-    results = _yf_concurrent_fetch(tickers, _yf_fetch_intraday_single, "today's movers")
-    
-    if sort_by_volume:
-        results.sort(key=lambda x: x.get('TODAY_VOLUME', 0), reverse=True)
-    else:
-        results.sort(key=lambda x: x.get('TODAY_CHANGE', 0), reverse=True)
-        
-    return pd.DataFrame(results[:limit])
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-@st.cache_data(ttl=300)
-def yf_get_top_losers_today(limit=10, market="us", sector=None, sort_by_volume=False):
-    """Get today's top losing stocks (concurrent)."""
-    tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-    if sector and sector.lower() in SECTOR_MAP:
-        target_sector = sector.lower()
-        tickers = [t for t in tickers if t in SECTOR_MAP[target_sector]]
-        if not tickers: tickers = sorted(SECTOR_MAP[target_sector])
-        
-    results = _yf_concurrent_fetch(tickers, _yf_fetch_intraday_single, "today's losers")
-    
-    if sort_by_volume:
-        results.sort(key=lambda x: x.get('TODAY_VOLUME', 0), reverse=True)
-    else:
-        results.sort(key=lambda x: x.get('TODAY_CHANGE', 0))  # ascending = worst first
-        
-    return pd.DataFrame(results[:limit])
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-@st.cache_data(ttl=3600)
-def yf_get_best_stocks_year(year, limit=10, market="us"):
-    """Get best performing stocks for a specific year (concurrent)."""
-    tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-    worker = lambda t: _yf_fetch_yearly_single(t, year)
-    results = _yf_concurrent_fetch(tickers, worker, f"{year} performance")
-    results.sort(key=lambda x: x['PERCENTAGE_CHANGE'], reverse=True)
-    return pd.DataFrame(results[:limit])
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-@st.cache_data(ttl=3600)
-def yf_get_worst_stocks_year(year, limit=10, market="us"):
-    """Get worst performing stocks for a specific year (concurrent)."""
-    tickers = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-    worker = lambda t: _yf_fetch_yearly_single(t, year)
-    results = _yf_concurrent_fetch(tickers, worker, f"{year} performance")
-    results.sort(key=lambda x: x['PERCENTAGE_CHANGE'])  # ascending = worst first
-    return pd.DataFrame(results[:limit])
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-@st.cache_data(ttl=3600)
-def yf_get_stock_info(ticker: str) -> pd.DataFrame:
-    """Deep-dive single stock: price, 52wk range, volume, P/E, sector."""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        hist = stock.history(period="5d")
-        today_change = 0.0
-        if len(hist) >= 2:
-            today_change = round(
-                ((hist['Close'].iloc[-1] - hist['Close'].iloc[-2]) / hist['Close'].iloc[-2]) * 100, 2
-            )
-        return pd.DataFrame([{
-            "TICKER": ticker,
-            "NAME": info.get("longName", ticker),
-            "CURRENT_PRICE": info.get("currentPrice", info.get("regularMarketPrice", 0)),
-            "TODAY_CHANGE": today_change,
-            "52W_HIGH": info.get("fiftyTwoWeekHigh", 0),
-            "52W_LOW": info.get("fiftyTwoWeekLow", 0),
-            "PE_RATIO": info.get("trailingPE", "N/A"),
-            "MARKET_CAP": info.get("marketCap", 0),
-            "VOLUME": info.get("volume", 0),
-            "SECTOR": info.get("sector", "N/A"),
-        }])
-    except Exception as e:
-        return pd.DataFrame([{"ERROR": str(e), "TICKER": ticker}])
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=20))
-@st.cache_data(ttl=3600)
-def yf_compare_stocks(tickers_list: list, period: str = "1mo") -> pd.DataFrame:
-    """Compare multiple stocks side-by-side over a period."""
-    import concurrent.futures as cf
-    results = []
-    def fetch_one(t):
-        try:
-            hist = yf.Ticker(t).history(period=period)
-            if len(hist) >= 2:
-                ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
-                return {
-                    "TICKER": t,
-                    "PERCENTAGE_CHANGE": round(ret, 2),
-                    "START_PRICE": round(hist['Close'].iloc[0], 2),
-                    "END_PRICE": round(hist['Close'].iloc[-1], 2),
-                    "AVG_VOLUME": int(hist['Volume'].mean()),
-                    "PERIOD": period,
-                }
-        except:
-            pass
-        return None
-    with cf.ThreadPoolExecutor(max_workers=10) as pool:
-        for r in pool.map(fetch_one, tickers_list):
-            if r:
-                results.append(r)
-    df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values("PERCENTAGE_CHANGE", ascending=False)
-    return df
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-@st.cache_data(ttl=3600)
-def yf_get_performance_period(ticker: str, period: str = "1mo") -> pd.DataFrame:
-    """
-    Single stock: returns full daily OHLCV history for the period
-    PLUS a summary row so STEP 5 can display both table and chart.
-    """
-    try:
-        hist = yf.Ticker(ticker).history(period=period)
-        if len(hist) < 2:
-            return pd.DataFrame()
-
-        # Strip timezone
-        hist.index = hist.index.tz_localize(None)
-
-        pct_change = round(
-            ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100, 2
-        )
-
-        # Full daily rows — gives the AI real data AND lets STEP 5 render a chart
-        df = hist.reset_index()[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        df.columns = ['DATE', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']
-        df['TICKER'] = ticker
-        df['PERIOD'] = period
-        df['PERCENTAGE_CHANGE'] = round(
-            ((df['CLOSE'] - df['CLOSE'].iloc[0]) / df['CLOSE'].iloc[0]) * 100, 2
-        )
-
-        # Append a summary row at the top so the screener display shows key stats
-        summary = pd.DataFrame([{
-            'DATE': df['DATE'].iloc[-1],
-            'TICKER': ticker,
-            'PERIOD': period,
-            'OPEN': round(hist['Open'].iloc[0], 2),
-            'HIGH': round(hist['High'].max(), 2),
-            'LOW': round(hist['Low'].min(), 2),
-            'CLOSE': round(hist['Close'].iloc[-1], 2),
-            'VOLUME': int(hist['Volume'].mean()),
-            'PERCENTAGE_CHANGE': pct_change,
-            'TRADING_DAYS': len(hist),
-            'START_PRICE': round(hist['Close'].iloc[0], 2),
-            'END_PRICE': round(hist['Close'].iloc[-1], 2),
-        }])
-
-        return pd.concat([summary, df], ignore_index=True)
-
-    except Exception as e:
-        return pd.DataFrame([{"ERROR": str(e), "TICKER": ticker}])
-
-
-def process_with_llm_agent(user_query):
-    """
-    LLM agent: Groq analyses query → picks a Yahoo Finance function → returns data.
-    
-    Returns:
-        (result_df, data_source, query_type)
-        - result_df: pd.DataFrame with columns matching STEP 5 expectations
-        - data_source: str for badge lookup
-        - query_type: "intraday" or "historical" for STEP 5 column mapping
-    """
-    # Ask the LLM to classify the query
-    classification_prompt = f"""You are a financial data routing agent. Current date: {datetime.now().strftime('%Y-%m-%d')}.
-
-Classify the user query and return ONLY valid JSON (no markdown, no explanation):
-{{
-    "function": "gainers_today" | "losers_today" | "best_year" | "worst_year" | "stock_info" | "compare" | "performance_period",
-    "market": "us" | "india",
-    "tickers": ["AAPL"],
-    "period": "1d" | "5d" | "1mo" | "3mo" | "6mo" | "1y",
-    "year": 2022,
-    "sector": "pharma" | "tech" | "energy" | "finance" | null,
-    "limit": 10
-}}
-
-Rules:
-- "top/best stocks today" → gainers_today
-- "worst/bottom stocks today" → losers_today
-- "top stocks this week" or "last week" → gainers_today, period="5d"
-- "top stocks last month" → gainers_today, period="1mo"
-- "last 3 months" → gainers_today, period="3mo"
-- "best stocks 2022" → best_year, year=2022
-- "worst stocks 2022" → worst_year, year=2022
-- "show me AAPL" or single company name → stock_info, tickers=["AAPL"]
-- "compare X and Y" → compare, tickers=["X","Y"]
-- "how did X perform last month" → performance_period, tickers=["X"], period="1mo"
-- "last week" → period="5d", "last month" → period="1mo", "last quarter" → period="3mo"
-- If query mentions "india", "indian", "nse" → market="india"
-- Indian stocks: append .NS (RELIANCE.NS, TCS.NS, INFY.NS, HDFCBANK.NS)
-- "Nifty 50" → use tickers=["RELIANCE.NS","TCS.NS","HDFCBANK.NS","INFY.NS","ICICIBANK.NS","HINDUNILVR.NS","ITC.NS","KOTAKBANK.NS","LT.NS","SBIN.NS","BAJFINANCE.NS","AXISBANK.NS","MARUTI.NS","TITAN.NS","WIPRO.NS","TECHM.NS","ULTRACEMCO.NS","NESTLEIND.NS","ASIANPAINT.NS","POWERGRID.NS"] with function=compare and period=5d
-- "Reliance Industries" → RELIANCE.NS
-- Sector pharma → tickers=["PFE","JNJ","MRK","ABBV","BMY","AMGN","GILD","BIIB","REGN","VRTX"]
-- Sector tech → tickers=["AAPL","MSFT","NVDA","GOOGL","META","AMZN","AMD","INTC","ORCL","CRM"]
-- "top 5 ..." → limit=5, "top 20 ..." → limit=20, default → limit=10
-
-User query: "{user_query}"
-"""
-
-    with st.spinner("🤖 AI analysing your query…"):
-        llm_response, model_used = call_llm(classification_prompt, "sql_generation")
-
-    # Parse LLM JSON response
-    try:
-        clean = llm_response.strip()
-        # Strip markdown code fences if present
-        if clean.startswith("```"):
-            clean = clean.split("```")[1].strip()
-            if clean.startswith("json"):
-                clean = clean[4:].strip()
-        decision = json.loads(clean)
-    except Exception:
-        st.warning("⚠️ AI couldn't parse intent — defaulting to top gainers today.")
-        decision = {"function": "gainers_today", "year": None, "market": "us", "limit": 10}
-
-    fn = decision.get("function", "gainers_today")
-    year = decision.get("year")
-    market = decision.get("market", "us").lower()
-    limit = min(int(decision.get("limit", 10)), 20)
-    agent_tickers = decision.get("tickers", [])
-    period = decision.get("period", "1mo")
-    sector = decision.get("sector")
-
-    # Show the decision
-    fn_display = fn.replace("_", " ").title()
-    extras = []
-    if year: extras.append(f"Year: {year}")
-    if agent_tickers: extras.append(f"Tickers: {', '.join(agent_tickers[:5])}")
-    if period and fn in ("compare", "performance_period"): extras.append(f"Period: {period}")
-    if sector: extras.append(f"Sector: {sector}")
-    extra_str = " | ".join(extras) if extras else "Today"
-    # Don't show the default badge for gainers_today with rolling periods
-    # it will be overridden by the specific timeframe badge below
-    if not (fn == "gainers_today" and period in ("5d", "1wk", "1w", "1mo", "3mo")):
-        st.info(f"🤖 **AI Decision:** {fn_display} | {extra_str} | Market: {market.upper()} | Limit: {limit}")
-
-    # Execute the chosen function
-    result_df = pd.DataFrame()
-    data_source = "yahoo_finance"
-    query_type = "historical"
-
-    if fn == "gainers_today":
-        period = decision.get("period", "1d")
-        if period in ("5d", "1wk", "1w", "1mo", "3mo"):
-            # Unified rolling performance screener
-            period_str = "5d" if period in ("5d", "1wk", "1w") else period
-            
-            def _fetch_period_single(ticker):
-                try:
-                    hist = yf.Ticker(ticker).history(period=period_str)
-                    if len(hist) >= 2:
-                        hist = hist.copy()
-                        # Only localize if timezone exists to avoid TypeError
-                        if hist.index.tz is not None:
-                            hist.index = hist.index.tz_localize(None)
-                        # Drop rows with NaN Close prices (e.g. KLAC delisted/missing data)
-                        hist = hist.dropna(subset=['Close'])
-                        if len(hist) < 2:
-                            return None
-                        start_price = hist['Close'].iloc[0]
-                        end_price = hist['Close'].iloc[-1]
-                        if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
-                            return None
-                        ret = ((end_price - start_price) / start_price) * 100
-                        return {
-                            "TICKER": ticker,
-                            "PERCENTAGE_CHANGE": round(ret, 2),
-                            "START_PRICE": round(start_price, 2),
-                            "END_PRICE": round(end_price, 2),
-                            "TRADING_DAYS": len(hist),
-                            "AVG_VOLUME": int(hist['Volume'].mean()),
-                        }
-                except:
-                    pass
-                return None
-                
-            tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-            # Apply sector filter if requested
-            if sector and sector.lower() in SECTOR_MAP:
-                target_sector = sector.lower()
-                tickers_pool = [t for t in tickers_pool if t in SECTOR_MAP[target_sector]]
-                if not tickers_pool: # Fallback to mapped list if pool filter results in empty
-                    tickers_pool = SECTOR_MAP[target_sector]
-            
-            results = _yf_concurrent_fetch(tickers_pool, _fetch_period_single, f"movers over {period_str}")
-            results.sort(key=lambda x: x['PERCENTAGE_CHANGE'], reverse=True)
-            result_df = pd.DataFrame(results[:limit])
-            
-            # Dynamic badging
-            sector_str = f" ({target_sector.title()})" if sector and sector.lower() in SECTOR_MAP else ""
-            badge_title = {"5d": "Gainers This Week", "1mo": "Gainers This Month", "3mo": "Gainers This Quarter"}.get(period_str, "Gainers")
-            ds_key = {"5d": "yahoo_finance_weekly", "1mo": "yahoo_finance_monthly", "3mo": "yahoo_finance_quarterly"}.get(period_str)
-            
-            st.info(f"🤖 **AI Decision:** {badge_title}{sector_str} | Period: {period_str} | Market: {market.upper()} | Limit: {limit}")
-            data_source = ds_key
-            query_type = "historical"  # reuse existing historical col_map
-        else:
-            sort_vol = "volume" in user_query.lower() or "active" in user_query.lower()
-            result_df = yf_get_top_gainers_today(limit=limit, market=market, sector=sector, sort_by_volume=sort_vol)
-            data_source = "yahoo_finance_intraday"
-            query_type = "intraday"
-
-    elif fn == "losers_today":
-        if sector and sector.lower() in SECTOR_MAP:
-            target_sector = sector.lower()
-            tickers_pool = INDIAN_LARGE_CAP if market == "india" else FULL_COVERAGE
-            tickers_pool = [t for t in tickers_pool if t in SECTOR_MAP[target_sector]]
-            if not tickers_pool:
-                tickers_pool = SECTOR_MAP[target_sector]
-            
-            def _fetch_loser(ticker):
-                try:
-                    hist = yf.Ticker(ticker).history(period="5d")
-                    if len(hist) >= 2:
-                        hist = hist.dropna(subset=['Close'])
-                        if len(hist) < 2:
-                            return None
-                        ret = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
-                        return {
-                            "TICKER": ticker,
-                            "PERCENTAGE_CHANGE": round(ret, 2),
-                            "START_PRICE": round(hist['Close'].iloc[0], 2),
-                            "END_PRICE": round(hist['Close'].iloc[-1], 2),
-                            "TRADING_DAYS": len(hist),
-                            "AVG_VOLUME": int(hist['Volume'].mean()),
-                        }
-                except:
-                    pass
-                return None
-            
-            results = _yf_concurrent_fetch(tickers_pool, _fetch_loser, f"sector losers")
-            results.sort(key=lambda x: x['PERCENTAGE_CHANGE'])  # ASC for losers
-            result_df = pd.DataFrame(results[:limit])
-            query_type = "historical"
-            data_source = "yahoo_finance_intraday"
-        else:
-            sort_vol = "volume" in user_query.lower() or "active" in user_query.lower()
-            result_df = yf_get_top_losers_today(limit=limit, market=market, sector=sector, sort_by_volume=sort_vol)
-            data_source = "yahoo_finance_intraday"
-            query_type = "intraday"
-
-    elif fn == "best_year" and year:
-        result_df = yf_get_best_stocks_year(year=year, limit=limit, market=market)
-        data_source = "yahoo_finance"
-        query_type = "historical"
-
-    elif fn == "worst_year" and year:
-        result_df = yf_get_worst_stocks_year(year=year, limit=limit, market=market)
-        data_source = "yahoo_finance"
-        query_type = "historical"
-
-    elif fn == "stock_info" and agent_tickers:
-        ticker = agent_tickers[0]
-        if market == "india" and not ticker.endswith(".NS") and not ticker.endswith(".BO"):
-            ticker += ".NS"
-        result_df = yf_get_stock_info(ticker)
-        data_source = "yahoo_finance"
-        query_type = "stock_info"
-
-    elif fn == "compare" and agent_tickers:
-        if market == "india":
-            agent_tickers = [t if t.endswith(".NS") or t.endswith(".BO") else t + ".NS" for t in agent_tickers]
-        result_df = yf_compare_stocks(agent_tickers, period)
-        data_source = "yahoo_finance"
-        query_type = "historical"
-
-    elif fn == "performance_period" and agent_tickers:
-        ticker = agent_tickers[0]
-        if market == "india" and not ticker.endswith(".NS"):
-            ticker += ".NS"
-        result_df = yf_get_performance_period(ticker, period)
-        data_source = "yahoo_finance"
-        query_type = "historical"
-
-    else:
-        st.warning(f"⚠️ Unknown function '{fn}'. Defaulting to top gainers today.")
-        result_df = yf_get_top_gainers_today(limit=limit, market=market)
-        data_source = "yahoo_finance_intraday"
-        query_type = "intraday"
-
-    return result_df, data_source, query_type
-
 def fetch_comparison_data_smart(ticker, start_date, end_date, fmp_api_key):
     """
     Smart data fetcher: tries DB first, falls back to Yahoo Finance API, then FMP API.
@@ -1572,12 +1065,7 @@ def cortex_complete(prompt):
     result = run_query(f"""
         SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large', '{safe}') as response
     """)
-    response = result.iloc[0]['RESPONSE']
-    # Strip Mistral formatting artifacts that leak into the output
-    import re
-    response = re.sub(r'\[/?INST\]', '', response)
-    response = re.sub(r'<\/?s>', '', response)
-    return response.strip()
+    return result.iloc[0]['RESPONSE']
 
 # ─── API KEY MANAGEMENT ───────────────────────────────────────────────────────
 def get_fmp_api_key():
@@ -1605,7 +1093,6 @@ if "groq_calls_today" not in st.session_state:
     st.session_state.groq_calls_today = 0
 
 # ─── SMART LLM ROUTER ────────────────────────────────────────────────────────
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def call_llm(prompt, task_type="general"):
     """Try Groq first (fast), fall back to Mistral (reliable)"""
     global groq_available
@@ -1781,10 +1268,7 @@ def fetch_yahoo_data(ticker):
             "Low": "LOW", "Close": "CLOSE", "Volume": "VOLUME"
         })
         df["TICKER"] = ticker.upper()
-        df["DATE"] = pd.to_datetime(df["DATE"])
-        # Only remove timezone if it exists (prevents TypeError on tz-naive data like Indian stocks)
-        if df["DATE"].dt.tz is not None:
-            df["DATE"] = df["DATE"].dt.tz_localize(None)
+        df["DATE"] = pd.to_datetime(df["DATE"]).dt.tz_localize(None)
         df = df[["DATE", "TICKER", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]]
         df = df.sort_values("DATE").reset_index(drop=True)
         
@@ -1882,33 +1366,10 @@ def check_ticker_in_db(ticker):
 def extract_tickers_from_question(question):
     """Use LLM to extract ticker symbols from natural language"""
     prompt = f"""Extract stock ticker symbols from this question. Return ONLY a JSON array of uppercase ticker symbols, nothing else.
-If the question mentions company names, convert to tickers. If it mentions 'tech stocks', return top 10 from: AAPL, MSFT, GOOGL, NVDA, META, TSLA, AMZN, NFLX, AVGO, ADBE.
-If it mentions 'banking stocks', return: JPM, BAC, GS, MS, WFC, C.
+If the question mentions company names, convert to tickers. If it mentions 'tech stocks', return: ["AAPL","MSFT","GOOGL","META","NVDA","TSLA","AMZN","NFLX","AMD","INTC"]
+If it mentions 'banking stocks', return: ["JPM","BAC","GS","MS","WFC","C"]
 If no specific stocks are mentioned, return an empty array [].
 Max 10 tickers.
-
-CRITICAL INDIAN STOCK MAPPING (never map these to US tickers):
-- Reliance Industries / Reliance → RELIANCE.NS (NOT RIG, NOT REL)
-- Infosys / Infy → INFY.NS
-- TCS / Tata Consultancy → TCS.NS
-- HDFC Bank / HDFC → HDFCBANK.NS
-- ICICI Bank / ICICI → ICICIBANK.NS
-- Wipro → WIPRO.NS
-- SBI / State Bank of India → SBIN.NS
-- L&T / Larsen / Larsen and Toubro → LT.NS
-- Kotak / Kotak Bank → KOTAKBANK.NS
-- Axis Bank → AXISBANK.NS
-- Sun Pharma → SUNPHARMA.NS
-- Bajaj Finance → BAJFINANCE.NS
-- HCL / HCL Tech → HCLTECH.NS
-- Tech Mahindra → TECHM.NS
-- Maruti / Maruti Suzuki → MARUTI.NS
-- Titan → TITAN.NS
-- Airtel / Bharti Airtel → BHARTIARTL.NS
-- ITC → ITC.NS
-- ONGC → ONGC.NS
-- Adani → ADANIENT.NS
-Always append .NS for Indian NSE stocks. Never map Indian company names to US tickers.
 
 Question: {question}
 
@@ -1959,35 +1420,6 @@ def smart_data_router(tickers, fmp_key):
     today = datetime.now().date()
     
     for ticker in tickers:
-        # ─── INTERNATIONAL TICKER SHORTCUT ───
-        # FMP doesn't support non-US exchanges (.NS, .BO, .L, .TO, etc.)
-        # Route directly to Yahoo Finance to avoid false "not found" errors
-        intl_suffixes = ('.NS', '.BO', '.L', '.TO', '.AX', '.HK', '.T', '.SS', '.SZ')
-        if any(ticker.upper().endswith(sfx) for sfx in intl_suffixes):
-            if yfinance_available:
-                yf_df, yf_err = fetch_yahoo_data(ticker)
-                if yf_err is None and len(yf_df) > 0:
-                    results[ticker] = {
-                        "source": "api",
-                        "badge": "🟡 YAHOO",
-                        "last_date": None,
-                        "rows": 0,
-                        "api_data": yf_df,
-                        "error": None
-                    }
-                    continue
-            # Yahoo also failed for this international ticker
-            results[ticker] = {
-                "source": "not_found",
-                "badge": "❌ NOT FOUND",
-                "last_date": None,
-                "rows": 0,
-                "api_data": None,
-                "error": f"No data available for {ticker}",
-                "suggestions": suggest_similar_tickers(ticker)
-            }
-            continue
-        
         exists, last_date, row_count, db_ok = check_ticker_in_db(ticker)
         
         if not db_ok:
@@ -2337,22 +1769,6 @@ def smart_ticker_lookup(search_input):
         # Retail / Consumer
         'walmart': 'WMT', 'target': 'TGT', 'costco': 'COST',
         'home depot': 'HD', 'lowes': 'LOW', "lowe's": 'LOW',
-        # Indian Stocks (NSE)
-        'reliance': 'RELIANCE.NS', 'reliance industries': 'RELIANCE.NS', 'ril': 'RELIANCE.NS',
-        'infosys': 'INFY.NS', 'infy': 'INFY.NS',
-        'tata consultancy': 'TCS.NS', 'tata consultancy services': 'TCS.NS', 'tcs': 'TCS.NS',
-        'hdfc bank': 'HDFCBANK.NS', 'hdfc': 'HDFCBANK.NS',
-        'wipro': 'WIPRO.NS', 'icici': 'ICICIBANK.NS', 'icici bank': 'ICICIBANK.NS',
-        'axis bank': 'AXISBANK.NS', 'sbi': 'SBIN.NS', 'state bank': 'SBIN.NS',
-        'state bank of india': 'SBIN.NS', 'bajaj finance': 'BAJFINANCE.NS',
-        'titan': 'TITAN.NS', 'asian paints': 'ASIANPAINT.NS',
-        'hcl': 'HCLTECH.NS', 'hcl tech': 'HCLTECH.NS', 'tech mahindra': 'TECHM.NS',
-        'maruti': 'MARUTI.NS', 'maruti suzuki': 'MARUTI.NS',
-        'larsen': 'LT.NS', 'larsen and toubro': 'LT.NS', 'l&t': 'LT.NS',
-        'kotak': 'KOTAKBANK.NS', 'kotak bank': 'KOTAKBANK.NS', 'kotak mahindra': 'KOTAKBANK.NS',
-        'adani': 'ADANIENT.NS', 'bharti airtel': 'BHARTIARTL.NS', 'airtel': 'BHARTIARTL.NS',
-        'sun pharma': 'SUNPHARMA.NS', 'dr reddy': 'DRREDDY.NS', 'dr reddys': 'DRREDDY.NS',
-        'ongc': 'ONGC.NS', 'ntpc': 'NTPC.NS', 'power grid': 'POWERGRID.NS', 'itc': 'ITC.NS',
         'nike': 'NKE', 'starbucks': 'SBUX', 'mcdonalds': 'MCD',
         "mcdonald's": 'MCD', 'coca cola': 'KO', 'coca-cola': 'KO',
         'coke': 'KO', 'pepsi': 'PEP', 'pepsico': 'PEP',
@@ -4071,87 +3487,44 @@ if selected_tickers:
                   AND date BETWEEN '{date_from}' AND '{date_to}'
                 ORDER BY date
             """)
-            
-            needs_yf_fallback = False
-            last_db_date = None
-            
-            if price_data is None or price_data.empty:
-                needs_yf_fallback = True
-                fetch_start = date_from
-            else:
-                price_data['DATE'] = pd.to_datetime(price_data['DATE'])
-                last_db_date = price_data['DATE'].max()
-                # If DB data is stale (ends more than 5 days before date_to)
-                if pd.to_datetime(date_to) - last_db_date > pd.Timedelta(days=5):
-                    needs_yf_fallback = True
-                    fetch_start = last_db_date + pd.Timedelta(days=1)
-                
-            if needs_yf_fallback:
-                yf_chart_dfs = []
-                for t in selected_tickers:
-                    try:
-                        hist = yf.Ticker(t).history(start=str(fetch_start.date() if hasattr(fetch_start, 'date') else fetch_start), end=str(date_to))
-                        if not hist.empty:
-                            df_t = hist.reset_index()[['Date', 'Close']].copy()
-                            df_t.columns = ['DATE', 'CLOSE']
-                            df_t['TICKER'] = t
-                            df_t['DATE'] = pd.to_datetime(df_t['DATE'])
-                            if df_t['DATE'].dt.tz is not None:
-                                df_t['DATE'] = df_t['DATE'].dt.tz_localize(None)
-                            yf_chart_dfs.append(df_t)
-                    except Exception:
-                        pass
-                if yf_chart_dfs:
-                    yf_data = pd.concat(yf_chart_dfs, ignore_index=True)
-                    if price_data is not None and not price_data.empty:
-                        price_data = pd.concat([price_data, yf_data], ignore_index=True).drop_duplicates(subset=['DATE', 'TICKER'])
-                        price_data = price_data.sort_values(['TICKER', 'DATE'])
-                    else:
-                        price_data = yf_data
+            price_data['DATE'] = pd.to_datetime(price_data['DATE'])
 
-            if price_data is not None and not price_data.empty:
-                if 'DATE' not in price_data.columns:
-                    price_data.columns = [c.upper() for c in price_data.columns]
-                price_data['DATE'] = pd.to_datetime(price_data['DATE'])
-                
-                fig = go.Figure()
-                colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6',
-                          '#F39C12', '#1ABC9C', '#E67E22']
+            fig = go.Figure()
+            colors = [T['gold'], '#4A90D9', '#E74C3C', '#2ECC71', '#9B59B6',
+                      '#F39C12', '#1ABC9C', '#E67E22']
 
-                for i, ticker in enumerate(selected_tickers):
-                    df_t = price_data[price_data['TICKER'] == ticker]
-                    if len(df_t) > 0:
-                        fig.add_trace(go.Scatter(
-                            x=df_t['DATE'], y=df_t['CLOSE'],
-                            name=ticker, mode='lines',
-                            line=dict(color=colors[i % len(colors)], width=1.8),
-                            hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %d, %Y}}<br>${{y:.2f}}<extra></extra>"
-                        ))
+            for i, ticker in enumerate(selected_tickers):
+                df_t = price_data[price_data['TICKER'] == ticker]
+                if len(df_t) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=df_t['DATE'], y=df_t['CLOSE'],
+                        name=ticker, mode='lines',
+                        line=dict(color=colors[i % len(colors)], width=1.8),
+                        hovertemplate=f"<b>{ticker}</b><br>%{{x|%b %d, %Y}}<br>$%{{y:.2f}}<extra></extra>"
+                    ))
 
-                fig.update_layout(
-                    paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
-                    font=dict(family='DM Sans', color=T['plotly_text'], size=11),
-                    legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'],
-                               borderwidth=1, font=dict(size=11)),
-                    xaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
-                               tickfont=dict(family='JetBrains Mono', size=10),
-                               zeroline=False, showspikes=True, spikecolor=T['gold'],
-                               spikethickness=1, spikedash='dot'),
-                    yaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
-                               tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10),
-                               zeroline=False, showspikes=True, spikecolor=T['gold'],
-                               spikethickness=1, spikedash='dot'),
-                    hovermode='x unified',
-                    margin=dict(l=10, r=10, t=20, b=10),
-                    height=420,
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(
+                paper_bgcolor=T['plotly_paper'], plot_bgcolor=T['plotly_plot'],
+                font=dict(family='DM Sans', color=T['plotly_text'], size=11),
+                legend=dict(bgcolor='rgba(0,0,0,0)', bordercolor=T['border'],
+                           borderwidth=1, font=dict(size=11)),
+                xaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                           tickfont=dict(family='JetBrains Mono', size=10),
+                           zeroline=False, showspikes=True, spikecolor=T['gold'],
+                           spikethickness=1, spikedash='dot'),
+                yaxis=dict(gridcolor=T['plotly_grid'], showgrid=True, gridwidth=0.5,
+                           tickprefix='$', tickfont=dict(family='JetBrains Mono', size=10),
+                           zeroline=False, showspikes=True, spikecolor=T['gold'],
+                           spikethickness=1, spikedash='dot'),
+                hovermode='x unified',
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=420,
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-                # Export button
-                csv_data = price_data.to_csv(index=False)
-                st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
-            else:
-                st.info("No price data available for the selected tickers and date range.")
+            # Export button
+            csv_data = price_data.to_csv(index=False)
+            st.download_button("📥 Download Price Data", csv_data, "price_trend.csv", "text/csv")
 
         except Exception as e:
             pass
@@ -4342,12 +3715,8 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        # Skeleton UI for AI Analysis
-        analysis_placeholder = st.empty()
-        with analysis_placeholder.container():
-            st.caption("🤖 AI analysing your query...")
-            render_skeleton()
-        try:
+        with st.spinner("Analyzing..."):
+            try:
                 # Enhancement 1: Intercept ROI / Investment queries
                 if any(word in prompt.lower() for word in ['invested', 'invest', 'worth', 'roi']):
                     roi_params = extract_roi_params(prompt)
@@ -4401,42 +3770,13 @@ Write a 3 sentence insightful analysis pointing out a key reason for the stock's
                                 
                             badges_html += sentiment_html
                             
-                            final_output = f"{html_card}\n{sentiment_html}\n{analysis_html}"
+                            final_output = f"{badges_html}<br>{html_card}\n{analysis_html}" if "html_card" in locals() else f"{badges_html}<br>{analysis_html}"
                             st.markdown(final_output, unsafe_allow_html=True)
                             st.session_state.messages.append({"role": "assistant", "content": final_output})
                             st.stop()
                             
-                # SCREENER BYPASS: screener intent skips ticker extraction
-                prompt_lower = prompt.lower()
-                screener_words = ['top', 'best', 'worst', 'gainers', 'losers', 'bottom',
-                                  'highest', 'lowest', 'most', 'biggest', 'leading',
-                                  'perform', 'performed', 'performance']
-                market_words = ['stocks', 'performers', 'companies', 'shares', 'movers']
-                has_screener_intent = (
-                    any(w in prompt_lower for w in screener_words) and
-                    any(w in prompt_lower for w in market_words)
-                )
-
-                if has_screener_intent:
-                    tickers = []  # Force empty → falls through to LLM agent screener
-                    extraction_model = "groq"  # default badge
-                else:
-                    # DATE RANGE BYPASS: queries with specific date ranges go to LLM agent
-                    date_range_signals = ['between', 'from january', 'from feb', 'from march',
-                                          'from april', 'from may', 'from june', 'from july',
-                                          'from august', 'from september', 'from october',
-                                          'from november', 'from december', 'january to',
-                                          'jan to', 'feb to', 'last month', 'last quarter',
-                                          'last 3 months', 'last 6 months', 'last year',
-                                          'perform', 'performed', 'performance']
-                    has_date_range_intent = any(w in prompt_lower for w in date_range_signals)
-
-                    if has_date_range_intent:
-                        tickers = []  # Force to LLM agent which handles performance_period correctly
-                        extraction_model = "groq"
-                    else:
-                        # Step 1: Extract tickers from the question
-                        tickers, extraction_model = extract_tickers_from_question(prompt)
+                # Step 1: Extract tickers from the question
+                tickers, extraction_model = extract_tickers_from_question(prompt)
                 ai_badge_class = "badge-groq" if extraction_model == "groq" else "badge-mistral"
                 ai_badge_text = "⚡ GROQ" if extraction_model == "groq" else "🛡️ MISTRAL"
                 
@@ -4605,16 +3945,35 @@ Generate the SQL now:"""
                             with st.expander("🔍 Generated SQL"):
                                 st.code(sql_query, language="sql")
                             try:
-                                # Skeleton UI for Snowflake Query
-                                db_placeholder = st.empty()
-                                with db_placeholder.container():
-                                    st.caption("💾 Accessing Snowflake Data Cloud...")
-                                    render_skeleton()
-                                try:
+                                with st.spinner("💾 Querying Snowflake Data Cloud..."):
                                     result_df = run_query(sql_query)
-                                finally:
-                                    db_placeholder.empty()
 
+                                # FALLBACK: If DB is empty and user asked for recent data, try fetching from API
+                                if (result_df is None or result_df.empty) and any(year in prompt for year in ['2023', '2024', '2025', '2026', 'today', 'now', 'recent']):
+                                    st.info("📡 DB returned no results for recent timeframe. Fetching live market data...")
+                                    progress_bar = st.progress(0)
+                                    with st.spinner(f"🔄 Fetching data for {len(db_tickers) if db_tickers else 'major'} stocks..."):
+                                        api_fallback_dfs = []
+                                        # Use a subset of major stocks if no specific tickers found or if searching for "best"
+                                        fetch_targets = db_tickers if db_tickers else MAJOR_STOCKS[:15]
+                                        for i, t in enumerate(fetch_targets):
+                                            # Skip if already in api_dfs from router
+                                            if any(not df.empty and df['TICKER'].iloc[0] == t for df in api_dfs):
+                                                continue
+                                            
+                                            # Update progress
+                                            progress_bar.progress((i + 1) / len(fetch_targets))
+                                            
+                                            fallback_df, fallback_err = fetch_live_data(t, fmp_api_key)
+                                            if fallback_err is None and not fallback_df.empty:
+                                                api_fallback_dfs.append(fallback_df)
+                                                # Mark as cached for next time (simulate cache detection for the info box)
+                                                st.session_state[f"api_cache_{t}"] = True
+                                        
+                                        if api_fallback_dfs:
+                                            result_df = pd.concat(api_fallback_dfs, ignore_index=True)
+                                            st.success("✅ Successfully retrieved live data from API fallback.")
+                                    progress_bar.empty()
 
                                 if not result_df.empty:
                                     # Check for unrealistic percentage values
@@ -4646,111 +4005,6 @@ Generate the SQL now:"""
                                                 result_df = result_df[mask].reset_index(drop=True)
                             except Exception as sql_err:
                                 pass  # Silent: API data fallback will handle this
-                                
-                        # --- YFINANCE HISTORICAL FALLBACK ---
-                        # If DB returned no results OR we bypassed DB entirely for API-only tickers, try fetching from Yahoo Finance directly.
-                        import re as _re
-                        historical_keywords = ['month by month', 'monthly', 'month-by-month', 'trend', 'history', 'historical', 'performance', 'over time']
-                        has_year = bool(_re.search(r'20[12]\d', prompt))
-                        is_historical_query = has_year or any(kw in prompt.lower() for kw in historical_keywords)
-                        
-                        if (result_df is None or result_df.empty) and (not has_api_data or is_historical_query):
-                            st.info("📡 DB returned no results. Fetching live market data from Yahoo Finance...")
-                            progress_bar = st.progress(0)
-                            yf_placeholder = st.empty()
-                            
-                            fetch_targets = tickers if len(tickers) > 0 else (db_tickers if db_tickers else MAJOR_STOCKS[:15])
-                            
-                            with yf_placeholder.container():
-                                st.caption(f"🔄 Fetching data for {len(fetch_targets)} stocks...")
-                                render_skeleton()
-                            try:
-                                api_fallback_dfs = []
-                                
-                                # Detect date range from the prompt for targeted fetching
-                                year_matches = _re.findall(r'20[12]\d', prompt)
-                                if year_matches:
-                                    start_year = min(int(y) for y in year_matches)
-                                    end_year = max(int(y) for y in year_matches)
-                                    fetch_start = f"{start_year}-01-01"
-                                    
-                                    present_keywords = ['present', 'today', 'now', 'current']
-                                    is_to_present = any(kw in prompt.lower() for kw in present_keywords)
-                                    current_year = pd.Timestamp.now().year
-                                    
-                                    if is_to_present or end_year >= current_year:
-                                        fetch_end = None
-                                    else:
-                                        fetch_end = f"{end_year + 1}-01-01"
-                                else:
-                                    fetch_start = "2024-01-01"
-                                    fetch_end = None  # defaults to today
-                                
-                                for i, t in enumerate(fetch_targets):
-                                    progress_bar.progress((i + 1) / len(fetch_targets))
-                                    try:
-                                        stock = yf.Ticker(t)
-                                        if fetch_end:
-                                            hist = stock.history(start=fetch_start, end=fetch_end)
-                                        else:
-                                            hist = stock.history(start=fetch_start)
-                                        if not hist.empty:
-                                            df = hist.reset_index()
-                                            df = df.rename(columns={
-                                                'Date': 'DATE', 'Open': 'OPEN', 'High': 'HIGH',
-                                                'Low': 'LOW', 'Close': 'CLOSE', 'Volume': 'VOLUME'
-                                            })
-                                            df['TICKER'] = t.upper()
-                                            df['DATE'] = pd.to_datetime(df['DATE'])
-                                            if df['DATE'].dt.tz is not None:
-                                                df['DATE'] = df['DATE'].dt.tz_localize(None)
-                                            df = df[['DATE', 'TICKER', 'OPEN', 'HIGH', 'LOW', 'CLOSE', 'VOLUME']]
-                                            api_fallback_dfs.append(df)
-                                    except Exception:
-                                        pass
-                                
-                                if api_fallback_dfs:
-                                    result_df = pd.concat(api_fallback_dfs, ignore_index=True)
-                                    has_api_data = True
-                                    
-                                    # Detect "month by month" queries and aggregate
-                                    monthly_keywords = ['month by month', 'monthly', 'month-by-month', 'each month', 'per month']
-                                    is_monthly = any(kw in prompt.lower() for kw in monthly_keywords)
-                                    
-                                    if is_monthly and 'CLOSE' in result_df.columns:
-                                        result_df['DATE'] = pd.to_datetime(result_df['DATE'])
-                                        
-                                        # Group by Ticker and Year-Month (represented as YYYY-MM-01)
-                                        result_df['MONTH'] = result_df['DATE'].dt.to_period('M').dt.to_timestamp()
-                                        
-                                        monthly_df = result_df.groupby(['TICKER', 'MONTH']).agg(
-                                            AVG_CLOSE=('CLOSE', 'mean'),
-                                            LAST_CLOSE=('CLOSE', 'last')
-                                        ).reset_index()
-                                        
-                                        # If querying up to present, use the live/last close for the current ongoing month
-                                        if fetch_end is None:
-                                            import datetime as _dt
-                                            current_month_ts = pd.Timestamp(_dt.datetime.now()).to_period('M').to_timestamp()
-                                            mask = monthly_df['MONTH'] == current_month_ts
-                                            monthly_df.loc[mask, 'AVG_CLOSE'] = monthly_df.loc[mask, 'LAST_CLOSE']
-                                            
-                                        monthly_df = monthly_df.drop(columns=['LAST_CLOSE'])
-                                        monthly_df['MONTH'] = monthly_df['MONTH'].dt.strftime('%Y-%m-%d')
-                                        
-                                        if len(fetch_targets) == 1:
-                                            result_df = monthly_df[['MONTH', 'AVG_CLOSE']].copy()
-                                            result_df = result_df.sort_values('MONTH').reset_index(drop=True)
-                                        else:
-                                            result_df = monthly_df[['TICKER', 'MONTH', 'AVG_CLOSE']].copy()
-                                            result_df = result_df.sort_values(['TICKER', 'MONTH']).reset_index(drop=True)
-                                            
-                                        st.success(f"✅ Successfully retrieved Yahoo Finance data ({len(result_df)} months)")
-                                    else:
-                                        st.success(f"✅ Successfully retrieved Yahoo Finance data ({len(result_df)} rows)")
-                            finally:
-                                yf_placeholder.empty()
-                                progress_bar.empty()
                         
                         if api_dfs:
                             api_combined = pd.concat(api_dfs, ignore_index=True)
@@ -4780,13 +4034,8 @@ Generate the SQL now:"""
                                             
                                             if not new_api_data.empty:
                                                 result_df = pd.concat([result_df, new_api_data[common_cols]], ignore_index=True)
-                                                
-                                                # Ensure DATE and TICKER exist before dropping duplicates across them
-                                                if 'DATE' in result_df.columns and 'TICKER' in result_df.columns:
-                                                    result_df = result_df.drop_duplicates(subset=['DATE', 'TICKER'], keep='last')
-                                                    result_df = result_df.sort_values('DATE', ascending=False).reset_index(drop=True)
-                                                elif 'TICKER' in result_df.columns:
-                                                    result_df = result_df.drop_duplicates(subset=['TICKER'], keep='last')
+                                                result_df = result_df.drop_duplicates(subset=['DATE', 'TICKER'], keep='last')
+                                                result_df = result_df.sort_values('DATE', ascending=False).reset_index(drop=True)
                                     else:
                                         result_df = pd.concat([result_df, api_combined[common_cols]], ignore_index=True)
                         
@@ -4833,31 +4082,13 @@ Your code:"""
                                 try:
                                     # Safe evaluation context
                                     original_df = result_df.copy()
-                                    try:
-                                        # Use pd.eval which is safer than exec() as it only evaluates expressions
-                                        # and doesn't allow arbitrary statement execution.
-                                        # We specifically instruct the LLM to provide a pandas filter expression.
-                                        if "df" in filter_code:
-                                            # If the LLM provided a full statement like 'df[df["col"] > 0]', 
-                                            # eval it directly.
-                                            result_df = pd.eval(filter_code, target=result_df, engine='python')
-                                        else:
-                                            # If it's just the condition like 'df["col"] > 0', use it to filter
-                                            condition = pd.eval(filter_code, target=result_df, engine='python')
-                                            result_df = result_df[condition]
-                                            
-                                        if isinstance(result_df, pd.Series):
-                                            result_df = result_df.to_frame()
-                                        elif isinstance(result_df, (int, float, str, np.number, bool)):
-                                            result_df = pd.DataFrame({"Result": [result_df]})
-                                    except Exception as eval_err:
-                                        # Fallback to query() if eval fails (sometimes simpler for LLMs)
-                                        try:
-                                            # Strip 'df[' and ']' if LLM was too verbose
-                                            clean_query = filter_code.replace('df[', '').rstrip(']')
-                                            result_df = result_df.query(clean_query)
-                                        except:
-                                            result_df = original_df 
+                                    local_env = {"df": result_df.copy(), "pd": pd}
+                                    exec(f"filtered_df = {filter_code}", {}, local_env)
+                                    result_df = local_env.get("filtered_df", result_df)
+                                    if isinstance(result_df, pd.Series):
+                                        result_df = result_df.to_frame()
+                                    elif isinstance(result_df, (int, float, str, np.number)):
+                                        result_df = pd.DataFrame({"Result": [result_df]})
                                         
                                     if result_df.empty and not original_df.empty:
                                         result_df = original_df # Fallback if AI filtering aggressively deleted everything
@@ -4921,165 +4152,450 @@ Write a 3-4 sentence professional analysis. Be specific with numbers."""
                 
                 # Enhancement 2: Stock Screener
                 else:
-                    user_query = prompt  # Ensure compatibility
+                    if not snowflake_available:
+                        st.warning("⚠️ Screener requires database access.")
+                        st.stop()
                     
+                    user_query = prompt # Ensure compatibility
                     # ═══════════════════════════════════════════════════════════════
-                    # LLM AGENT: Replaces all old routing/SQL/parsing logic
+                    # STEP 1: EXTRACT TEMPORAL CONTEXT (with query_type)
                     # ═══════════════════════════════════════════════════════════════
-                    result_df, data_source, query_type = process_with_llm_agent(user_query)
-                    target_year = datetime.now().year  # For display/download naming
-                    
-                    # ═══════════════════════════════════════════════════════════════
-                    # STEP 4: DISPLAY DATA SOURCE BADGE (preserved)
-                    # ═══════════════════════════════════════════════════════════════
-                    if not result_df.empty and data_source:
-                        source_badges = {
-                            "snowflake": "💾 **Snowflake Database** | Historical market data (1962-2024)",
-                            "yahoo_finance": "📡 **Yahoo Finance API** | Year-to-date real-time data",
-                            "yahoo_finance_intraday": "📡 **Yahoo Finance API** | Today's intraday performance",
-                            "yahoo_finance_weekly": "📡 **Yahoo Finance API** | 5-day weekly performance",
-                            "yahoo_finance_monthly": "📡 **Yahoo Finance API** | 30-day monthly performance",
-                            "yahoo_finance_quarterly": "📡 **Yahoo Finance API** | 90-day quarterly performance",
-                            "yahoo_screener": "🚀 **Yahoo Fast Screener** | Pre-screened instant results"
-                        }
-                        badge_html = f"""
-                        <div style="background:#1a2332; border-left:3px solid #FFD700; 
-                                    padding:0.75rem; margin:0.5rem 0; border-radius:4px;">
-                            <small style="color:#888;">DATA SOURCE</small><br>
-                            <span style="color:#FFD700;">{source_badges.get(data_source, 'Unknown')}</span>
-                        </div>
-                        """
-                        st.markdown(badge_html, unsafe_allow_html=True)
+                    target_year, use_live_data, temporal_desc, query_type = extract_temporal_context(user_query)
+                    # query_type: "intraday", "ytd", or "historical"
 
-                    # ═══════════════════════════════════════════════════════════════
-                    # STEP 5: DISPLAY RESULTS (preserved — existing visualization)
-                    # ═══════════════════════════════════════════════════════════════
-                    if result_df is None or result_df.empty:
-                        st.warning("No results found. Try rephrasing your query.")
+                    # Show detection to user
+                    if query_type == "intraday":
+                        st.info(f"📡 **Intraday Query Detected**: {temporal_desc}")
+                    elif use_live_data:
+                        st.info(f"📡 **Real-time Query Detected**: {temporal_desc}")
                     else:
-                        st.success(f"✅ **Found {len(result_df)} stocks** | Updated: {datetime.now().strftime('%I:%M %p')}")
+                        st.info(f"💾 **Historical Query Detected**: {temporal_desc}")
+
+                    # Extract limits
+                    num_match = re.search(r'\b(top|best|highest|worst|bottom|lowest)\s+(\d+)\b', user_query.lower())
+                    limit = int(num_match.group(2)) if num_match else 5
+                    limit = min(limit, 20)
+                    
+                    is_percentage_screener = any(word in user_query.lower() for word in [
+                        'top', 'best', 'highest', 'performance', 'gain', 'return', 
+                        'winner', 'loser', 'losers', 'worst', 'bottom', 'lowest'
+                    ])
+                    
+                    if is_percentage_screener:
+                        # Detect user intent
+                        # Smart filtering UI (collapsed by default for clean UX)
+                        with st.expander("⚙️ Advanced Filters", expanded=False):
+                            filter_col1, filter_col2, filter_col3 = st.columns(3)
                         
-                        result_df.columns = [c.upper() for c in result_df.columns]
-                        display_df = result_df.copy()
-                        
-                        # Dynamic column mapping based on query type
-                        if query_type == "intraday":
-                            col_map = {'TICKER': 'Ticker', 'TODAY_CHANGE': "Today's Change (%)", 'YESTERDAY_CLOSE': 'Yesterday Close', 'CURRENT_PRICE': 'Current Price', 'TODAY_VOLUME': "Today's Volume"}
-                        else:
-                            col_map = {'TICKER': 'Ticker', 'PERCENTAGE_CHANGE': 'Return (%)', 'FIRST_CLOSE': 'Start Price', 'LAST_CLOSE': 'End Price', 'START_PRICE': 'Start Price', 'END_PRICE': 'End Price', 'TRADING_DAYS': 'Days', 'AVG_VOLUME': 'Avg Vol'}
-                        display_df.columns = [col_map.get(c, c) for c in display_df.columns]
-                        
-                        # Format columns
-                        if "Today's Change (%)" in display_df.columns: display_df["Today's Change (%)"] = display_df["Today's Change (%)"].apply(lambda x: f"{x:+.2f}%")
-                        if 'Return (%)' in display_df.columns: display_df['Return (%)'] = display_df['Return (%)'].apply(lambda x: f"{x:+.2f}%")
-                        if 'Start Price' in display_df.columns: display_df['Start Price'] = display_df['Start Price'].apply(lambda x: f"${x:.2f}")
-                        if 'End Price' in display_df.columns: display_df['End Price'] = display_df['End Price'].apply(lambda x: f"${x:.2f}")
-                        if 'Yesterday Close' in display_df.columns: display_df['Yesterday Close'] = display_df['Yesterday Close'].apply(lambda x: f"${x:.2f}")
-                        if 'Current Price' in display_df.columns: display_df['Current Price'] = display_df['Current Price'].apply(lambda x: f"${x:.2f}")
-                        if 'Avg Vol' in display_df.columns: display_df['Avg Vol'] = display_df['Avg Vol'].apply(lambda x: f"{x:,.0f}")
-                        if "Today's Volume" in display_df.columns: display_df["Today's Volume"] = display_df["Today's Volume"].apply(lambda x: f"{x:,.0f}")
-                        
-                        st.dataframe(display_df, use_container_width=True, hide_index=True)
-                        
-                        def get_analysis_depth(query: str, df_rows: int) -> tuple[str, int]:
-                            """Returns (depth_label, max_sentences) based on query complexity."""
-                            query_lower = query.lower()
+                            with filter_col1:
+                                market_cap_filter = st.radio(
+                                    "Market Cap Coverage",
+                                    options=["All Stocks", "S&P 500 Coverage", "Large-Cap Only", "Mega-Cap Only"],
+                                    index=1,  # Default: S&P 500 Coverage (balanced)
+                                    help="""
+                                    • All Stocks: Complete market (like Google) - may include small-caps
+                                    • S&P 500 Coverage: ~200 major stocks across all sectors
+                                    • Large-Cap Only: Top 50 established companies
+                                    • Mega-Cap Only: Top 8 tech giants (FAANG+)
+                                    """
+                                )
                             
-                            complex_signals = [
-                                'compare', 'vs', 'versus', 'between', 'why', 'reason',
-                                'explain', 'analyse', 'analyze', 'trend', 'pattern',
-                                'nifty', 'sector', 'all', 'portfolio'
-                            ]
-                            simple_signals = [
-                                'price', 'current', 'today', 'quick', 'show me', 'what is'
-                            ]
+                            with filter_col2:
+                                min_price = st.slider(
+                                    "Min Stock Price",
+                                    min_value=0.0,
+                                    max_value=10.0,
+                                    value=1.0,
+                                    step=0.5,
+                                    help="Filter out penny stocks below this price"
+                                )
                             
-                            complexity_score = sum(1 for w in complex_signals if w in query_lower)
-                            simplicity_score = sum(1 for w in simple_signals if w in query_lower)
+                            with filter_col3:
+                                min_volume = st.select_slider(
+                                    "Min Avg Volume",
+                                    options=[10000, 100000, 500000, 1000000, 5000000],
+                                    value=1000000,
+                                    format_func=lambda x: f"{x:,.0f}",
+                                    help="Minimum average daily trading volume"
+                                )
+                        
+                        # Apply filter based on selection
+                        if market_cap_filter == "All Stocks":
+                            ticker_filter = "AND ticker NOT IN ('', 'NULL', 'N/A')"
+                            filter_badge = "🌍 ALL STOCKS"
+                            filter_desc = "Complete market coverage (includes small-caps)"
+                            price_threshold = min_price
+                            volume_threshold = min_volume
+                            ticker_list = FULL_COVERAGE
                             
-                            # More rows = more to analyze
-                            if df_rows > 15 or complexity_score >= 2:
-                                return "detailed", 6
-                            elif df_rows > 5 or complexity_score == 1:
-                                return "moderate", 4
+                        elif market_cap_filter == "S&P 500 Coverage":
+                            tickers_str = "', '".join(FULL_COVERAGE)
+                            ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                            filter_badge = "🎯 S&P 500"
+                            filter_desc = f"{len(FULL_COVERAGE)} major stocks across all sectors"
+                            price_threshold = min_price
+                            volume_threshold = min_volume
+                            ticker_list = FULL_COVERAGE
+                            
+                        elif market_cap_filter == "Large-Cap Only":
+                            tickers_str = "', '".join(LARGE_CAP)
+                            ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                            filter_badge = "🏢 LARGE-CAP"
+                            filter_desc = f"Top {len(LARGE_CAP)} established companies"
+                            price_threshold = min_price
+                            volume_threshold = max(min_volume, 1000000)
+                            ticker_list = LARGE_CAP
+                            
+                        else:  # Mega-Cap Only
+                            tickers_str = "', '".join(MEGA_CAP)
+                            ticker_filter = f"AND ticker IN ('{tickers_str}')"
+                            filter_badge = "⭐ MEGA-CAP"
+                            filter_desc = "Top 8 tech giants (FAANG+)"
+                            price_threshold = min_price
+                            volume_threshold = max(min_volume, 5000000)
+                            ticker_list = MEGA_CAP
+                    
+                        # Professional info display
+                        st.markdown(f"""
+                        <div style="background:{T['bg_card']}; border-left:3px solid {T['gold']}; 
+                                    padding:1rem; border-radius:0 6px 6px 0; margin-bottom:1rem;">
+                            <div style="display:flex; align-items:center; gap:10px; margin-bottom:0.5rem;">
+                                <span style="font-size:0.75rem; font-weight:700; letter-spacing:0.1em; 
+                                             color:{T['gold']}; background:{T['bg_card2']}; 
+                                             padding:4px 10px; border-radius:4px;">
+                                    {filter_badge}
+                                </span>
+                                <span style="font-size:0.85rem; color:{T['text_secondary']};">
+                                    {filter_desc}
+                                </span>
+                            </div>
+                            <div style="font-size:0.75rem; color:{T['text_muted']}; line-height:1.6;">
+                                Filters: Price ≥ ${price_threshold} • Volume ≥ {volume_threshold:,} • 
+                                Returns: -95% to +300% • Min 20 trading days | <b>{temporal_desc}</b>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        # ═══════════════════════════════════════════════════════════════
+                        # STEP 2: INITIALIZE ALL VARIABLES (CRITICAL!)
+                        # ═══════════════════════════════════════════════════════════════
+
+                        # Sorting
+                        if 'order_by' not in locals() or order_by is None:
+                            if any(word in user_query.lower() for word in ['worst', 'losers', 'bottom']):
+                                order_by = "ORDER BY percentage_change ASC"
+                            elif any(word in user_query.lower() for word in ['volume', 'traded', 'liquid']):
+                                order_by = "ORDER BY avg_volume DESC"
                             else:
-                                return "brief", 2
+                                order_by = "ORDER BY percentage_change DESC"
 
-                        # AI Analysis — grounded to real fetched data only
-                        # TRUNCATION: send head(10) to avoid context bloat and massive payloads
-                        # Drop any rows with NaN in critical columns before display/analysis
-                        result_df = result_df.dropna(subset=[c for c in result_df.columns if c in ['PERCENTAGE_CHANGE', 'START_PRICE', 'END_PRICE', 'CLOSE', 'CURRENT_PRICE']], how='any')
-                        data_context = result_df.head(10).to_string(index=False)
+                        # Limits and thresholds
+                        if 'limit' not in locals():
+                            limit = 10
+
+                        if 'price_threshold' not in locals():
+                            price_threshold = 1.0
+
+                        if 'volume_threshold' not in locals():
+                            volume_threshold = 1000000
+
+                        if 'min_trading_days' not in locals():
+                            min_trading_days = 50
+
+                        # ═══════════════════════════════════════════════════════════════
+                        # ENHANCED QUERY TYPE DETECTION (Yahoo Screener + Intraday)
+                        # ═══════════════════════════════════════════════════════════════
+                        query_lower = user_query.lower()
+                        use_yahoo_screener = False
+                        screener_type = None
+
+                        if any(keyword in query_lower for keyword in ['top gainers', 'biggest gainers', 'best gainers']):
+                            use_yahoo_screener = True
+                            screener_type = "gainers"
+                            st.info("🚀 **Using Yahoo Finance Top Gainers Screener** (Instant results!)")
+                        elif any(keyword in query_lower for keyword in ['top losers', 'biggest losers', 'worst losers']):
+                            use_yahoo_screener = True
+                            screener_type = "losers"
+                            st.info("📉 **Using Yahoo Finance Top Losers Screener** (Instant results!)")
+                        elif any(keyword in query_lower for keyword in ['most active', 'most traded', 'highest volume']):
+                            use_yahoo_screener = True
+                            screener_type = "actives"
+                            st.info("📊 **Using Yahoo Finance Most Active Screener** (Instant results!)")
+
+                        market = "in" if any(kw in query_lower for kw in ['indian', 'india', 'nse']) else "us"
+
+                        skip_database = False
+                        skip_normal_route = False
+                        data_source = None
+                        result_df = pd.DataFrame()
+                        year_label = str(target_year)
+
+                        if use_yahoo_screener and query_type == "intraday":
+                            with st.spinner(f"⚡ Fetching {screener_type} from Yahoo Finance..."):
+                                result_df = fetch_yahoo_top_movers(query_type=screener_type, market=market, limit=limit)
+                            if not result_df.empty:
+                                data_source = "yahoo_screener"
+                                st.success(f"✅ **Yahoo Screener** | {len(result_df)} {screener_type} | Updated: {datetime.now().strftime('%I:%M %p')}")
+                            skip_normal_route = True
+                            skip_database = True
+
+                        if not skip_normal_route:
+                            if 'ticker_list' not in locals() or ticker_list is None:
+                                ticker_list, fallback_desc, est_time = get_smart_ticker_universe(user_query, query_type)
+                                st.info(f"📊 {fallback_desc} | Estimated time: {est_time}")
+                                
+                                # Set routing triggers if dealing with mid-caps
+                                if EXTENDED_UNIVERSE == ticker_list:
+                                    skip_database = True
+                                    use_live_data = True
+                                    if query_type != "intraday":
+                                        query_type = "ytd"
+                                        
+                            # Additional routing rules
+                            if query_type == "intraday" or target_year >= datetime.now().year:
+                                skip_database = True
+                                use_live_data = True
+
+                        # ═══════════════════════════════════════════════════════════════
+                        # STEP 3: ROUTE BASED ON QUERY TYPE AND OVERRIDES
+                        # ═══════════════════════════════════════════════════════════════
+
+                        data_source = None
+                        result_df = pd.DataFrame()
+                        year_label = str(target_year)
                         
-                        depth_label, max_sentences = get_analysis_depth(user_query, len(result_df))
+                        if not skip_normal_route:
+                            # INTRADAY UNIVERSE ALIAS (Inherit dynamically determined ticker_list)
+                            INTRADAY_STOCKS = ticker_list if 'ticker_list' in locals() and ticker_list is not None else LARGE_CAP_UNIVERSE
 
-                        depth_instructions = {
-                            "brief": "Write 2 sentences maximum. Be direct and specific.",
-                            "moderate": "Write 3-4 sentences. Cover the key finding and one notable pattern.",
-                            "detailed": "Write 5-6 sentences. Cover: top performer, notable patterns, sector themes, any outliers, and one actionable insight."
-                        }
-                        
-                        if query_type == "intraday":
-                            analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real market data below.
-DO NOT use any prior knowledge for specific prices, percentages, or dates.
-Every number you cite must come directly from this data.
+                            if query_type == "intraday":
+                                # ─────────────────────────────────────────────────────────────
+                                # ROUTE A: TODAY'S INTRADAY PERFORMANCE
+                                # ─────────────────────────────────────────────────────────────
+                                st.info(f"📡 **Intraday Query**: Fetching today's performance ({temporal_desc})")
+                                
+                                # Time-of-day awareness
+                                current_hour = datetime.now().hour
+                                if current_hour < 9:
+                                    st.info("⏰ Markets haven't opened yet. Showing pre-market movers.")
+                                elif current_hour >= 16:
+                                    st.info("📊 Market closed. Showing today's final performance.")
+                                else:
+                                    st.info(f"📈 Market is open. Live data as of {datetime.now().strftime('%I:%M %p')}")
+                                
+                                with st.spinner(f"⏳ Fetching today's stock movements..."):
+                                    try:
+                                        st.info(f"📊 Scanning {len(INTRADAY_STOCKS)} major stocks for today's top movers")
+                                        result_df = fetch_intraday_performance(
+                                            tickers=INTRADAY_STOCKS,  # Simple, fast, reliable
+                                            limit=limit,
+                                            sort_by=None,
+                                            user_query=user_query
+                                        )
+                                        
+                                        if not result_df.empty:
+                                            data_source = "yahoo_finance_intraday"
+                                            st.success(f"✅ **Today's Data** | {len(result_df)} stocks | Updated: {datetime.now().strftime('%I:%M %p')}")
+                                        else:
+                                            st.warning("⚠️ No intraday data available")
+                                            
+                                    except Exception as e:
+                                        st.error(f"❌ Intraday fetch failed: {str(e)}")
 
-QUERY: {user_query}
-REAL DATA (source: Yahoo Finance, fetched just now):
-{data_context}
+                            elif (query_type == "ytd" or use_live_data) and skip_database:
+                                # ─────────────────────────────────────────────────────────────
+                                # ROUTE B: YEAR-TO-DATE REAL-TIME (API Only)
+                                # ─────────────────────────────────────────────────────────────
+                                st.info(f"📡 **YTD Query**: Fetching year-to-date {target_year} performance")
+                                
+                                with st.spinner(f"⏳ Connecting to Yahoo Finance API..."):
+                                    try:
+                                        result_df = fetch_realtime_screener_data(
+                                            tickers=ticker_list,  # Use FULL list
+                                            year=target_year,
+                                            filters={
+                                                'price_threshold': price_threshold,
+                                                'volume_threshold': volume_threshold,
+                                                'min_trading_days': min_trading_days
+                                            },
+                                            sort_by=order_by,
+                                            limit=limit
+                                        )
+                                        
+                                        if not result_df.empty:
+                                            data_source = "yahoo_finance"
+                                            st.success(f"✅ **Live Data** | {len(result_df)} stocks from Yahoo Finance | Updated: Just now")
+                                        else:
+                                            st.warning(f"⚠️ No YTD data available for {target_year}")
+                                            
+                                    except Exception as e:
+                                        st.error(f"❌ API Error: {str(e)}")
+                                        st.info("💡 Trying database as fallback...")
+                                        skip_database = False  # Force DB fallback
 
-{depth_instructions[depth_label]}
-IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
-Highlight the biggest mover and any notable pattern.
-Every number must come directly from the data above."""
-                        elif query_type == "stock_info":
-                            analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real stock data below.
-DO NOT invent or recall any prices, percentages, or dates not present in this data.
+                        if not skip_database and (query_type == "historical" or result_df.empty):
+                            # ─────────────────────────────────────────────────────────────
+                            # ROUTE C: HISTORICAL DATABASE
+                            # ─────────────────────────────────────────────────────────────
+                            st.info(f"💾 Searching {target_year} data in database...")
+                            
+                            sql_query = f"""
+                            WITH yearly_prices AS (
+                                SELECT
+                                    ticker, date, close, volume,
+                                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date ASC) as first_row,
+                                    ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY date DESC) as last_row,
+                                    COUNT(*) OVER (PARTITION BY ticker) as trading_days,
+                                    AVG(volume) OVER (PARTITION BY ticker) as avg_volume
+                                FROM FINANCE_AI_DB.STOCK_DATA.PRICES
+                                WHERE YEAR(date) = {target_year}
+                                  AND close > {price_threshold}
+                                  AND ticker IN ({', '.join([f"'{t}'" for t in ticker_list])})
+                                  AND close IS NOT NULL AND volume IS NOT NULL
+                            ),
+                            stock_performance AS (
+                                SELECT
+                                    ticker,
+                                    MAX(CASE WHEN first_row = 1 THEN close END) as first_close,
+                                    MAX(CASE WHEN last_row = 1 THEN close END) as last_close,
+                                    MAX(trading_days) as trading_days,
+                                    MAX(avg_volume) as avg_volume
+                                FROM yearly_prices
+                                GROUP BY ticker
+                                HAVING MAX(trading_days) >= {min_trading_days}
+                                   AND MAX(avg_volume) > {volume_threshold}
+                            )
+                            SELECT
+                                ticker as TICKER, ROUND(((last_close - first_close) / first_close * 100), 2) as PERCENTAGE_CHANGE,
+                                first_close as FIRST_CLOSE, last_close as LAST_CLOSE, 
+                                trading_days as TRADING_DAYS, ROUND(avg_volume, 0) as AVG_VOLUME
+                            FROM stock_performance
+                            WHERE first_close > 0 AND last_close > 0
+                              AND ((last_close - first_close) / first_close * 100) BETWEEN -95 AND 300
+                            {order_by} LIMIT {limit}
+                            """
+                            with st.expander("🔍 Generated SQL"): st.code(sql_query, language="sql")
+                            
+                            try:
+                                with st.spinner(f"🔍 Querying database..."):
+                                    result_df = run_query(sql_query)
+                                
+                                if result_df is not None and not result_df.empty:
+                                    data_source = "snowflake"
+                                    st.success(f"💾 **Historical Data** | {len(result_df)} stocks from Snowflake DB")
+                                else:
+                                    st.warning(f"⚠️ No data found in database for {target_year}")
+                                    
+                                    # ─────────────────────────────────────────────────────────
+                                    # ROUTE D: API FALLBACK FOR EMPTY DB (2020+)
+                                    # ─────────────────────────────────────────────────────────
+                                    if target_year >= 2020:
+                                        st.info(f"📡 Database empty - trying Yahoo Finance API...")
+                                        with st.spinner(f"⏳ Fetching live data..."):
+                                            result_df = fetch_realtime_screener_data(
+                                                tickers=ticker_list,
+                                                year=target_year,
+                                                filters={
+                                                    'price_threshold': price_threshold,
+                                                    'volume_threshold': volume_threshold,
+                                                    'min_trading_days': min_trading_days
+                                                },
+                                                sort_by=order_by,
+                                                limit=limit
+                                            )
+                                        if not result_df.empty:
+                                            data_source = "yahoo_finance"
+                                            st.success(f"✅ **Fallback Success** | {len(result_df)} stocks from Yahoo Finance")
+                                            # Make sure we don't skip the visualization section
+                                            use_live_data = True
+                            except Exception as e:
+                                st.error(f"❌ Database Error: {str(e)}")
 
-QUERY: {user_query}
-REAL DATA (source: Yahoo Finance, fetched just now):
-{data_context}
+                        # ═══════════════════════════════════════════════════════════════
+                        # STEP 4: DISPLAY DATA SOURCE BADGE
+                        # ═══════════════════════════════════════════════════════════════
+                        if not result_df.empty and data_source:
+                            # Added explicit debug logs to confirm visualization block is reached
+                            st.write(f"<!-- DEBUG: About to render {len(result_df)} results. Source: {data_source} -->", unsafe_allow_html=True)
+                            
+                            source_badges = {
+                                "snowflake": "💾 **Snowflake Database** | Historical market data (1962-2024)",
+                                "yahoo_finance": "📡 **Yahoo Finance API** | Year-to-date real-time data",
+                                "yahoo_finance_intraday": "📡 **Yahoo Finance API** | Today's intraday performance",
+                                "yahoo_screener": "🚀 **Yahoo Fast Screener** | Pre-screened instant results"
+                            }
+                            badge_html = f"""
+                            <div style="background:#1a2332; border-left:3px solid #FFD700; 
+                                        padding:0.75rem; margin:0.5rem 0; border-radius:4px;">
+                                <small style="color:#888;">DATA SOURCE</small><br>
+                                <span style="color:#FFD700;">{source_badges.get(data_source, 'Unknown')}</span>
+                            </div>
+                            """
+                            st.markdown(badge_html, unsafe_allow_html=True)
 
-{depth_instructions[depth_label]} covering current price, 52-week range, and sector context.
-IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
-Use only the exact numbers shown above."""
-                        elif query_type == "historical":
-                            analysis_prompt = f"""You are a financial analyst. Analyze ONLY the real performance data below.
-DO NOT use training data for specific prices or returns — use only what is shown here.
-
-QUERY: {user_query}
-REAL DATA (source: Yahoo Finance):
-{data_context}
-
-{depth_instructions[depth_label]}. Reference exact percentage returns and prices from the data.
-IMPORTANT: Never mix percentage values with dollar values. If PERCENTAGE_CHANGE is 3.00, say '3.00%' not '$3.00'.
-Identify the top performer and any notable outlier.
-Every number must come directly from the data above."""
+                        # ═══════════════════════════════════════════════════════════════
+                        # STEP 5: DISPLAY RESULTS
+                        # ═══════════════════════════════════════════════════════════════
+                        if result_df is None or result_df.empty:
+                            st.warning(f"No results found matching criteria for {year_label}.")
                         else:
-                            analysis_prompt = f"""You are a financial analyst. Analyze ONLY this real market data.
-DO NOT invent any figures — every number must come from the data below.
+                            result_df.columns = [c.upper() for c in result_df.columns]
+                            display_df = result_df.copy()
+                            
+                            # Dynamic column mapping based on query type
+                            if query_type == "intraday":
+                                col_map = {'TICKER': 'Ticker', 'TODAY_CHANGE': "Today's Change (%)", 'YESTERDAY_CLOSE': 'Yesterday Close', 'CURRENT_PRICE': 'Current Price', 'TODAY_VOLUME': "Today's Volume"}
+                            else:
+                                col_map = {'TICKER': 'Ticker', 'PERCENTAGE_CHANGE': 'Return (%)', 'FIRST_CLOSE': 'Start Price', 'LAST_CLOSE': 'End Price', 'START_PRICE': 'Start Price', 'END_PRICE': 'End Price', 'TRADING_DAYS': 'Days', 'AVG_VOLUME': 'Avg Vol'}
+                            display_df.columns = [col_map.get(c, c) for c in display_df.columns]
+                            
+                            # Format columns
+                            if "Today's Change (%)" in display_df.columns: display_df["Today's Change (%)"] = display_df["Today's Change (%)"].apply(lambda x: f"{x:+.2f}%")
+                            if 'Return (%)' in display_df.columns: display_df['Return (%)'] = display_df['Return (%)'].apply(lambda x: f"{x:+.2f}%")
+                            if 'Start Price' in display_df.columns: display_df['Start Price'] = display_df['Start Price'].apply(lambda x: f"${x:.2f}")
+                            if 'End Price' in display_df.columns: display_df['End Price'] = display_df['End Price'].apply(lambda x: f"${x:.2f}")
+                            if 'Yesterday Close' in display_df.columns: display_df['Yesterday Close'] = display_df['Yesterday Close'].apply(lambda x: f"${x:.2f}")
+                            if 'Current Price' in display_df.columns: display_df['Current Price'] = display_df['Current Price'].apply(lambda x: f"${x:.2f}")
+                            if 'Avg Vol' in display_df.columns: display_df['Avg Vol'] = display_df['Avg Vol'].apply(lambda x: f"{x:,.0f}")
+                            if "Today's Volume" in display_df.columns: display_df["Today's Volume"] = display_df["Today's Volume"].apply(lambda x: f"{x:,.0f}")
+                            
+                            st.dataframe(display_df, use_container_width=True, hide_index=True)
+                            
+                            # AI Analysis
+                            if query_type == "intraday":
+                                analysis_prompt = f"Analyze today's top stock movers: {result_df.head(5).to_string()}"
+                            else:
+                                analysis_prompt = f"Analyze these top performance leaders in {target_year}: {result_df.head(5).to_string()}"
+                            insights, model = call_llm(analysis_prompt, "analysis")
+                            badge = "⚡ Groq" if model == "groq" else "🛡️ Cortex"
+                            st.markdown(f'<div class="insight-box"><div class="insight-label">⬡ AI Analysis — {badge}</div>{insights}</div>', unsafe_allow_html=True)
+                            
+                            csv = result_df.to_csv(index=False)
+                            st.download_button("📥 Download", csv, f"screener_{target_year}.csv", "text/csv", key=f"dl_scr_{len(st.session_state.messages)}")
+                            
+                            st.session_state.messages.append({"role": "assistant", "content": insights, "sql": sql_query if 'sql_query' in locals() else "", "data": result_df, "id": len(st.session_state.messages)})
 
-QUERY: {user_query}
-REAL DATA:
-{data_context}
-
-{depth_instructions[depth_label]} with specific numbers from the data above.
-Every number must come directly from the data."""
-                        insights, model = call_llm(analysis_prompt, "analysis")
-                        badge = "⚡ Groq" if model == "groq" else "🛡️ Cortex"
-                        st.markdown(f'<div class="insight-box"><div class="insight-label">⬡ AI Analysis — {badge}</div>{insights}</div>', unsafe_allow_html=True)
+                    else:
+                        # Non-percentage/Generic screener
+                        sql_prompt = f"Generate a Snowflake SQL query to answer: {prompt}. Columns: date, ticker, open, high, low, close, volume. Table: FINANCE_AI_DB.STOCK_DATA.PRICES. Filter close > 1.0. Limit 20."
+                        sql_query, _ = call_llm(sql_prompt, "sql_generation")
+                        sql_query = sql_query.replace("```sql", "").replace("```", "").strip().split(';')[0]
                         
-                        csv = result_df.to_csv(index=False)
-                        st.download_button("📥 Download", csv, f"screener_{target_year}.csv", "text/csv", key=f"dl_scr_{len(st.session_state.messages)}")
-                        
-                        st.session_state.messages.append({"role": "assistant", "content": insights, "data": result_df, "id": len(st.session_state.messages)})
-
-
-
-        except Exception as e:
-            st.error(f"Error processing request: {e}")
-        finally:
-            analysis_placeholder.empty()
+                        with st.expander("🔍 Generated SQL"): st.code(sql_query, language="sql")
+                        try:
+                            result_df = run_query(sql_query)
+                            if result_df.empty:
+                                st.info("No results found.")
+                            else:
+                                st.dataframe(result_df, use_container_width=True)
+                                insights, model = call_llm(f"Analyze these results: {result_df.head(5).to_string()}", "analysis")
+                                badge = "⚡ Groq" if model == "groq" else "🛡️ Cortex"
+                                st.markdown(f'<div class="insight-box"><div class="insight-label">⬡ AI Analysis — {badge}</div>{insights}</div>', unsafe_allow_html=True)
+                                st.session_state.messages.append({"role": "assistant", "content": insights, "sql": sql_query, "data": result_df, "id": len(st.session_state.messages)})
+                        except Exception as e:
+                            st.error(f"Query failed: {e}")
+            except Exception as e:
+                st.error(f"Error processing request: {e}")
 
 # Clear chat
 if st.session_state.messages:
